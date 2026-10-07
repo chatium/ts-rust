@@ -57,9 +57,12 @@ for (const name of ["layout", "go-dir", "exe", "libs", "dist", "version", "git-h
 }
 const { layout, "go-dir": goDir, libs, dist, version, "git-head": gitHead, out, name } = args;
 if (layout !== "typescript" && layout !== "typescript-go") throw new Error(`unknown --layout ${layout}`);
-if (name !== "typescript" && name !== "tsc-rs") throw new Error(`unknown --name ${name}`);
+// `@<scope>/tsc-rs` is a build of a fork under its own npm scope (chatium/ts-rust): its platform
+// packages are `@<scope>/tsc-rs-<os>-<arch>` (npm/getExePath.js).
+const scoped = /^@[a-z0-9-]+\/tsc-rs$/.test(name);
+if (name !== "typescript" && name !== "tsc-rs" && !scoped) throw new Error(`unknown --name ${name}`);
 const asTypescript = name === "typescript";
-const binName = asTypescript ? "tsc" : name;
+const binName = asTypescript ? "tsc" : "tsc-rs";
 const packageVersion = args["package-version"] ?? version;
 const atN = layout === "typescript";
 const root = atN ? path.dirname(goDir) : goDir;
@@ -76,7 +79,11 @@ const platforms = args.exe.map(value => {
         nodeOs,
         nodeArch,
         exe,
-        packageName: asTypescript ? `@typescript/typescript-${nodeOs}-${nodeArch}` : `@${name}/${nodeOs}-${nodeArch}`,
+        packageName: asTypescript
+            ? `@typescript/typescript-${nodeOs}-${nodeArch}`
+            : scoped
+            ? `${name}-${nodeOs}-${nodeArch}`
+            : `@${name}/${nodeOs}-${nodeArch}`,
     };
 });
 
@@ -125,6 +132,13 @@ else {
     input.homepage = "https://github.com/pingdotgg/ts-rust";
     input.bugs = { url: "https://github.com/pingdotgg/ts-rust/issues" };
     input.repository = { type: "git", url: "git+https://github.com/pingdotgg/ts-rust.git" };
+    if (scoped) {
+        input.author = "Chatium (fork of tsc-rs by Theo Browne)";
+        input.description = "tsc-rs, a Rust port of the TypeScript 7 compiler: the chatium/ts-rust build";
+        input.homepage = "https://github.com/chatium/ts-rust";
+        input.bugs = { url: "https://github.com/chatium/ts-rust/issues" };
+        input.repository = { type: "git", url: "git+https://github.com/chatium/ts-rust.git" };
+    }
 }
 delete input.scripts;
 delete input.devDependencies;
@@ -193,7 +207,7 @@ if (asTypescript) {
     fs.copyFileSync(path.join(inputDir, "typescript-package-readme.md"), path.join(mainDir, "README.md"));
 }
 else {
-    fs.copyFileSync(path.join(here, `${name}-readme.md`), path.join(mainDir, "README.md"));
+    fs.copyFileSync(path.join(here, `${name.replace(/^@/, "").replace("/", "-")}-readme.md`), path.join(mainDir, "README.md"));
     fs.copyFileSync(path.join(here, "getExePath.js"), path.join(mainDir, "lib", "getExePath.js"));
 }
 if (args["native-bin"]) {

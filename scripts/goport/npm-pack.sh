@@ -45,7 +45,7 @@ while [[ ${1:-} == --name || ${1:-} == --also || ${1:-} == --package-version ]];
   esac
   shift 2
 done
-[[ $name == typescript || $name == tsc-rs ]] || usage
+[[ $name == typescript || $name == tsc-rs || $name =~ ^@[a-z0-9-]+/tsc-rs$ ]] || usage
 [[ $name == typescript || ${#package_version[@]} == 2 ]] || usage
 if [[ ${1:-} == --go ]]; then
   [[ $name == typescript && ${#also[@]} == 0 ]] || usage

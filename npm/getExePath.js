@@ -11,7 +11,10 @@ import { fileURLToPath } from "node:url";
 export default function getExePath() {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const { name } = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-    const platformPackageName = `@${name}/${process.platform}-${process.arch}`;
+    // A scoped build (`@<scope>/tsc-rs`, npm/pack.mjs) has `@<scope>/tsc-rs-<platform>-<arch>`.
+    const platformPackageName = name.startsWith("@")
+        ? `${name}-${process.platform}-${process.arch}`
+        : `@${name}/${process.platform}-${process.arch}`;
     let exeDir;
     try {
         const packageJson = typeof import.meta.resolve === "function"

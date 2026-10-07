@@ -1,0 +1,75 @@
+# Builds the linux-x64 tsc of the @chatium/tsc-rs packages on a GitHub-hosted runner, as the build
+# job of release.yml does: static musl, non-PIE, jemalloc with bin/tsgo.rs JEMALLOC_CONF built in.
+# The packages are packed from its artifact and a macOS build (npm/pack.mjs --name @chatium/tsc-rs,
+# npm/chatium-tsc-rs-readme.md).
+name: Chatium linux-x64
+
+on:
+  push:
+    branches: [chatium]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The toolchain of release.yml.
+  RUSTUP_TOOLCHAIN: 1.95.0
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      # The fat-LTO build needs more disk and memory than a standard runner leaves free.
+      - name: Free disk space, add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          df -h / /mnt && free -h
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+      - run: sudo apt-get update -q && sudo apt-get install -yq musl-tools
+      - name: Build
+        run: |
+          export CC_x86_64_unknown_linux_musl=musl-gcc
+          export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
+          JEMALLOC_SYS_WITH_MALLOC_CONF=$(sed -n 's/^const JEMALLOC_CONF: &str = "\([^"]*\)";$/\1/p' crates/ts_goport/src/bin/tsgo.rs | head -1)
+          [[ -n $JEMALLOC_SYS_WITH_MALLOC_CONF ]] || { echo "::error::no JEMALLOC_CONF in bin/tsgo.rs"; exit 1; }
+          export JEMALLOC_SYS_WITH_MALLOC_CONF
+          cargo build --profile goport --locked -p ts_goport --bin tsgo --features noembed --target x86_64-unknown-linux-musl
+          mkdir -p "$RUNNER_TEMP/out"
+          cp target/x86_64-unknown-linux-musl/goport/tsgo "$RUNNER_TEMP/out/tsc"
+          git rev-parse HEAD > "$RUNNER_TEMP/out/COMMIT"
+      - name: Check the tsc
+        run: |
+          out="$RUNNER_TEMP/out"
+          dir="$RUNNER_TEMP/check"
+          crates/ts_goport/scripts/copy-libs.sh "$dir"
+          cp "$out/tsc" "$dir/tsc"
+          [[ $("$dir/tsc" --version) == "Version 7."* ]]
+          cd "$RUNNER_TEMP"
+          echo 'const x: number = "a";' > a.ts
+          "$dir/tsc" --listFilesOnly --lib es5 a.ts | grep -qx "$dir/lib.es5.d.ts"
+          set +e
+          "$dir/tsc" --noEmit a.ts > check.txt
+          rc=$?
+          set -e
+          cat check.txt
+          [[ $rc == 2 ]] && grep -q "error TS2322" check.txt
+          file "$dir/tsc" | tee /dev/stderr | grep -q "statically linked"
+          # Static: it starts on musl (Alpine) too.
+          docker run --rm -v "$dir:/t:ro" alpine:3 /t/tsc --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tsc-linux-x64
+          path: |
+            ${{ runner.temp }}/out/tsc
+            ${{ runner.temp }}/out/COMMIT
+          if-no-files-found: error

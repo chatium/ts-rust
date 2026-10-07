@@ -60,7 +60,9 @@ function useNativeBin() {
     }
     const target = path.relative(fs.realpathSync(path.dirname(binPath)), fs.realpathSync(exe));
     // npm links node_modules/.bin/<bin> to this path.
-    const npmLink = path.relative(path.join(path.dirname(pkgDir), ".bin"), binPath);
+    // A scoped package is one directory deeper in node_modules.
+    const nodeModules = pkg.name.startsWith("@") ? path.dirname(path.dirname(pkgDir)) : path.dirname(pkgDir);
+    const npmLink = path.relative(path.join(nodeModules, ".bin"), binPath);
     // The paths go in sh "..." strings on a JS line comment.
     for (const p of [target, npmLink]) {
         if (/["$`\\\n\r\u2028\u2029]/.test(p)) {
