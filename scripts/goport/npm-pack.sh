@@ -120,7 +120,9 @@ native_bin=()
 node "$repo/npm/pack.mjs" --layout "$layout" --go-dir "$go_dir" --exe "$bin/tsc" "${also[@]}" --libs "$libs" \
   --dist "$src/dist" --version "$version" --git-head "$git_head" --out "$out/pkg" --name "$name" \
   "${package_version[@]}" "${native_bin[@]}"
-rm -rf "${out:?}/$name" "$out/$name"-*-*/ "$out/$name"-*.tgz
+# npm/pack.mjs and npm pack name @<scope>/tsc-rs <scope>-tsc-rs.
+dir=${name#@} && dir=${dir/\//-}
+rm -rf "${out:?}/$dir" "$out/$dir"-*-*/ "$out/$dir"-*.tgz
 for d in "$out"/pkg/*; do
   mv "$d" "$out/"
   (cd "$out/$(basename "$d")" && npm pack --silent --pack-destination "$out" > /dev/null)

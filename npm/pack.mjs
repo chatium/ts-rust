@@ -149,7 +149,9 @@ input.publishConfig = asTypescript ? { access: "public", tag: publishTag() } : {
 fs.rmSync(out, { recursive: true, force: true });
 
 // The main package (`typescript`, or `tsc-rs`).
-const mainDir = path.join(out, name);
+// The output dirs and the README are named like npm's tarballs: `@<scope>/tsc-rs` is `<scope>-tsc-rs`.
+const dirName = name.replace(/^@/, "").replace("/", "-");
+const mainDir = path.join(out, dirName);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.dirname(here);
 
@@ -207,7 +209,7 @@ if (asTypescript) {
     fs.copyFileSync(path.join(inputDir, "typescript-package-readme.md"), path.join(mainDir, "README.md"));
 }
 else {
-    fs.copyFileSync(path.join(here, `${name.replace(/^@/, "").replace("/", "-")}-readme.md`), path.join(mainDir, "README.md"));
+    fs.copyFileSync(path.join(here, `${dirName}-readme.md`), path.join(mainDir, "README.md"));
     fs.copyFileSync(path.join(here, "getExePath.js"), path.join(mainDir, "lib", "getExePath.js"));
 }
 if (args["native-bin"]) {
@@ -220,7 +222,7 @@ writeLicense(mainDir);
 
 // The platform packages: the lib files and the native tsc in lib/.
 for (const { nodeOs, nodeArch, exe, packageName } of platforms) {
-    const platformDir = path.join(out, `${name}-${nodeOs}-${nodeArch}`);
+    const platformDir = path.join(out, `${dirName}-${nodeOs}-${nodeArch}`);
     const platformPackage = {
         ...input,
         bin: undefined,
