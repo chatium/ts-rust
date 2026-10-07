@@ -14,6 +14,8 @@
 
 use crate::contentmapper::prelude::*;
 
+use crate::contentmapper::muxconn::{MuxConn, ProtocolFactory};
+
 use crate::flags_macros::go_enum;
 use crate::frontend::json_ext::{
     AnyValue, marshal_field, unmarshal_string_as, unmarshal_struct_fields, unmarshal_uint_as,
@@ -1285,14 +1287,14 @@ const IPC_REMOTE_ERROR_PREFIX: &str = "ipc: remote error [";
 
 // PORT: Go runs the connection's read loop on a goroutine and closes the
 // process when it ends: `go func() { _ = conn.Run(ctx); _ = rwc.Close() }()`.
-// The ipc port reads each response inside `Call` on the calling thread
-// (see ipc/conn_async.rs), so no read loop runs between calls. This
-// connection closes the process when a call fails because the connection
-// ended (a read or a write failed), which is where Go's read loop ends. A
-// call that ends with `ctx` or with the mapper's error response leaves the
-// process open, as in Go.
+// `MuxConn` reads on its own thread, as `Run` does, so that the parse
+// workers can call the mapper too (`ConcurrentTransform`). This connection
+// closes the process when a call fails because the connection ended (a read
+// or a write failed), which is where Go's read loop ends. A call that ends
+// with `ctx` or with the mapper's error response leaves the process open,
+// as in Go.
 struct ProcessConn {
-    conn: Rc<ipc::AsyncConn>,
+    conn: Arc<MuxConn>,
     rwc: Arc<dyn ProcessExitState>,
 }
 
@@ -1335,6 +1337,48 @@ impl ipc::Conn for ProcessConn {
             self.close_if_ended(ctx, err);
         }
         result
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+// PORT: not in Go, where the parse goroutines call `Project.Transform`. The
+// project is dispatch-thread state; this is what a parse worker needs to
+// transform a file of the project: the mapper's connection, which threads
+// can share (`MuxConn`), the project handle and what decoding needs.
+pub struct ConcurrentTransform {
+    conn: Arc<MuxConn>,
+    project_handle: String,
+    position_encoding: PositionEncoding,
+    diagnostic_source: String,
+}
+
+impl ConcurrentTransform {
+    /// The mapper's result for `content` of `file_name`, as
+    /// `Project::transform` decodes it.
+    pub fn transform(
+        &self,
+        file_name: &str,
+        content: &str,
+    ) -> std::result::Result<Result, GoError> {
+        let raw = ipc::Conn::call(
+            &*self.conn,
+            &context::background(),
+            METHOD_TRANSFORM,
+            Some(Box::new(TransformParams {
+                file_name: file_name.to_string(),
+                content: content.to_string(),
+                project_handle: self.project_handle.clone(),
+            })),
+        )?;
+        decode_transform_result(
+            &raw,
+            content,
+            &self.position_encoding,
+            &self.diagnostic_source,
+        )
     }
 }
 
@@ -1416,21 +1460,25 @@ pub fn new_host_with_options(
                 once: OnceLock::new(),
             });
             let transport: Arc<dyn ipc::ReadWriteCloser> = rwc.clone();
-            let mut protocol: Box<dyn ipc::Protocol> =
-                Box::new(ipc::new_jsonrpc_protocol(transport.clone()));
-            if let Some(logger) = &logger {
-                protocol = Box::new(LoggingProtocol {
-                    protocol,
-                    mapper_name: diagnostic_name.clone(),
-                    logger: logger.clone(),
-                });
-            }
-            let async_conn =
-                ipc::new_async_conn_with_protocol(transport, protocol, Rc::new(RejectHandler));
-            // PORT: Go starts the read loop here (`go conn.Run(ctx)`); see
-            // `ProcessConn`.
+            let protocol_logger = logger
+                .clone()
+                .map(|logger| (diagnostic_name.clone(), logger));
+            let new_protocol: ProtocolFactory = Arc::new(move || {
+                let protocol: Box<dyn ipc::Protocol> =
+                    Box::new(ipc::new_jsonrpc_protocol(transport.clone()));
+                match &protocol_logger {
+                    Some((mapper_name, logger)) => Box::new(LoggingProtocol {
+                        protocol,
+                        mapper_name: mapper_name.clone(),
+                        logger: logger.clone(),
+                    }),
+                    None => protocol,
+                }
+            });
+            // Go starts the read loop here (`go conn.Run(ctx)`); `MuxConn`
+            // starts its reader thread.
             let conn: Rc<dyn ipc::Conn> = Rc::new(ProcessConn {
-                conn: async_conn,
+                conn: MuxConn::start(new_protocol),
                 rwc: rwc.clone(),
             });
             let (initialize_ctx, cancel) = context::with_timeout(ctx, INITIALIZE_TIMEOUT);
@@ -1763,6 +1811,26 @@ impl HostImpl {
         mapper: &Rc<Mapper>,
     ) -> std::result::Result<(Rc<dyn ipc::Conn>, PositionEncoding, String), GoError> {
         self.conn_for_locked(mapper)
+    }
+
+    // PORT: not in Go (see `ConcurrentTransform`). `None` when the mapper
+    // has no process connection (it failed to start, or a test dialer).
+    fn concurrent_transform(
+        &self,
+        mapper: &Rc<Mapper>,
+        project_handle: String,
+    ) -> Option<Arc<ConcurrentTransform>> {
+        if project_handle.is_empty() {
+            return None;
+        }
+        let (conn, position_encoding, diagnostic_source) = self.conn_for(mapper).ok()?;
+        let process = conn.as_any()?.downcast_ref::<ProcessConn>()?;
+        Some(Arc::new(ConcurrentTransform {
+            conn: process.conn.clone(),
+            project_handle,
+            position_encoding,
+            diagnostic_source,
+        }))
     }
 
     // Go: contentmapper/hostimpl.go:831 host.connForLocked
@@ -2346,6 +2414,16 @@ impl Project for ProjectLease {
         host.transform_locked(mapper, request, &handle)
     }
 
+    fn concurrent_transform(&self, mapper: &Rc<Mapper>) -> Option<Arc<ConcurrentTransform>> {
+        let host = &self.host;
+        let key = self.entry_key(mapper).cloned().unwrap_or_default();
+        let entry = host.project_entry(&key)?;
+        // An open that fails here fails again in `transform`, which reports it.
+        host.open_project_locked(&host.ctx, &entry).ok()?;
+        let handle = entry.borrow().project_handle.clone();
+        host.concurrent_transform(mapper, handle)
+    }
+
     // Go: contentmapper/hostimpl.go:1021 projectLease.Close
     fn close(&self) -> std::result::Result<(), GoError> {
         if self.once.replace(true) {
@@ -2382,6 +2460,10 @@ impl Project for RetainedProject {
         request: Request,
     ) -> std::result::Result<Result, GoError> {
         Project::transform(&*self.project_lease, mapper, request)
+    }
+
+    fn concurrent_transform(&self, mapper: &Rc<Mapper>) -> Option<Arc<ConcurrentTransform>> {
+        Project::concurrent_transform(&*self.project_lease, mapper)
     }
 
     // Go: contentmapper/hostimpl.go:872 retainedProject.Close

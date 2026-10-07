@@ -10,6 +10,7 @@
 pub mod contentmapper;
 pub mod host;
 pub mod hostimpl;
+pub mod muxconn;
 pub mod transform;
 
 pub use contentmapper::*;

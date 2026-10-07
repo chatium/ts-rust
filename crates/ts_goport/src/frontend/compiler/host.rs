@@ -317,6 +317,20 @@ impl CompilerHost for CompilerHostImpl {
         if !ok {
             return Ok(SourceFiles::default());
         }
+        // PORT: not in Go: the transform and parse that a parse worker made
+        // ahead (`take_prefetched_mapped`).
+        if let Some((file, mapped)) = take_prefetched_mapped(parse_options, &content) {
+            return contentmapper::adopt_prefetched_parse(
+                parse_options,
+                &content,
+                mapper,
+                &**project,
+                file,
+                &mapped.virtual_extension,
+                mapped.mappings,
+                mapped.diagnostic_directives,
+            );
+        }
         let files =
             contentmapper::transform_and_parse(parse_options, &content, mapper, &**project)?;
         let fs = CompilerHost::fs(self);

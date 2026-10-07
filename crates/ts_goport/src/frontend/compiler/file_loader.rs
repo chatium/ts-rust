@@ -6,8 +6,8 @@
 
 use super::files_parser::{TakenParse, count_prep, note_prep_taken};
 use crate::contentmapper::{
-    DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError, InitializeErrorKind,
-    InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
+    ConcurrentTransform, DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError,
+    InitializeErrorKind, InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
     SupplementalFileCollisionError, TransformError, TransformErrorKind,
 };
 use crate::frontend::prelude::*;
@@ -93,6 +93,10 @@ pub struct FileLoader {
     pub content_mapper_failures: RefCell<FxHashMap<*const Mapper, i32>>,
     pub content_mapper_init_failed: RefCell<FxHashSet<*const Mapper>>,
     pub content_mapper_diagnostics: RefCell<Vec<Diagnostic>>,
+    /// What the parse workers transform the files of each mapper with, by
+    /// mapper identity (`concurrent_content_mapper_transform`).
+    // PORT: not in Go (see `FilesParser::prefetch_request`).
+    pub concurrent_transforms: RefCell<FxHashMap<String, Option<Arc<ConcurrentTransform>>>>,
     // ts#64299. PORT: Go `moduleResolutionErrorOnce` plus the error is an
     // `Option` that keeps the first error.
     pub module_resolution_error: RefCell<Option<GoError>>,
@@ -265,6 +269,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         content_mapper_failures: RefCell::new(FxHashMap::default()),
         content_mapper_init_failed: RefCell::new(FxHashSet::default()),
         content_mapper_diagnostics: RefCell::new(Vec::new()),
+        concurrent_transforms: RefCell::new(FxHashMap::default()),
         module_resolution_error: RefCell::new(None),
         opts,
     };
@@ -1216,6 +1221,41 @@ impl FileLoader {
 
     // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
     // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
+    /// What a parse worker can transform the content-mapped file
+    /// `file_name` with, cached per mapper. `None` keeps the file's
+    /// transform on this thread: the mapper failed, its host has no
+    /// concurrent transform, or `GOPORT_MAPPED_PREFETCH` is `0` (an A/B
+    /// switch).
+    // PORT: not in Go, where the parse goroutines transform (tsgo#4712).
+    pub(crate) fn concurrent_content_mapper_transform(
+        &self,
+        file_name: &str,
+    ) -> Option<Arc<ConcurrentTransform>> {
+        if std::env::var_os("GOPORT_MAPPED_PREFETCH").is_some_and(|value| value == "0") {
+            return None;
+        }
+        let mapper = self
+            .opts
+            .config
+            .get_content_mapper_for_file_name(file_name)?;
+        if self.content_mapper_unavailable(Some(&mapper)) {
+            return None;
+        }
+        let identity = mapper.identity();
+        if let Some(transform) = self.concurrent_transforms.borrow().get(&identity) {
+            return transform.clone();
+        }
+        let transform = self
+            .opts
+            .host
+            .content_mapper_project()
+            .and_then(|project| project.concurrent_transform(&mapper));
+        self.concurrent_transforms
+            .borrow_mut()
+            .insert(identity, transform.clone());
+        transform
+    }
+
     fn content_mapper_unavailable(&self, mapper: Option<&Rc<Mapper>>) -> bool {
         let Some(mapper) = mapper else {
             return false;

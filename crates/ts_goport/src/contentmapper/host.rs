@@ -475,6 +475,14 @@ pub trait Project {
     ) -> std::result::Result<Result, GoError>;
     // Close releases this project reference and closes mapper project handles when no references remain.
     fn close(&self) -> std::result::Result<(), GoError>;
+    // PORT: not in Go, where the parse goroutines call `Transform`. What a
+    // parse worker can transform this project's files of `mapper` with
+    // (`ConcurrentTransform`); `None` leaves every transform to the loading
+    // thread.
+    fn concurrent_transform(&self, mapper: &Rc<Mapper>) -> Option<Arc<ConcurrentTransform>> {
+        let _ = mapper;
+        None
+    }
 }
 
 // Go: contentmapper/host.go:295 Host

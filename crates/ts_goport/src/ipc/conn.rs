@@ -59,6 +59,12 @@ pub trait Conn {
         method: &str,
         params: Option<Box<dyn AnyValue>>,
     ) -> Result<(), GoError>;
+
+    // PORT: not in Go. Lets an owner find its own connection type behind
+    // `Rc<dyn Conn>` (the content mapper host's `ProcessConn`).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 // Go: ipc/conn.go:37 UnmarshalParams

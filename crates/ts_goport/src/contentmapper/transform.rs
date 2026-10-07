@@ -169,7 +169,7 @@ pub fn parse_result(
 }
 
 // Go: contentmapper/transform.go:123 isModuleVirtualExtension
-fn is_module_virtual_extension(extension: &str) -> bool {
+pub(crate) fn is_module_virtual_extension(extension: &str) -> bool {
     [
         tspath::EXTENSION_MTS,
         tspath::EXTENSION_CTS,
@@ -177,6 +177,46 @@ fn is_module_virtual_extension(extension: &str) -> bool {
         tspath::EXTENSION_CJS,
     ]
     .contains(&extension)
+}
+
+/// The files of a transform whose virtual text a parse worker parsed
+/// (`files_parser::take_prefetched_mapped`), as `transform_and_parse` makes
+/// them for a result with no diagnostics and no supplemental outputs: the
+/// worker passes on no other result.
+// PORT: not in Go, where the parse goroutines transform (tsgo#4712).
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_prefetched_parse(
+    parse_options: &SourceFileParseOptions,
+    content: &str,
+    mapper: &Rc<Mapper>,
+    project: &dyn Project,
+    source_file: ParsedSourceFile,
+    virtual_extension: &str,
+    mappings: Arc<spanmap::SpanMap>,
+    diagnostic_directives: Vec<ast::MappedDiagnosticDirective>,
+) -> std::result::Result<SourceFiles, GoError> {
+    let transform_identity = match project.identity(mapper) {
+        Ok(transform_identity) => transform_identity,
+        Err(err) => {
+            return Err(new_transform_error(TransformErrorKind::PROJECT, Some(err)).to_go_error());
+        }
+    };
+    let source_file = Rc::new(source_file);
+    source_file.set_content_mapper_info(ast::ContentMapperSourceFileInfo {
+        content_mapper: mapper.identity(),
+        transform_identity,
+        parse_options: parse_options.clone(),
+        virtual_file_name: format!("{}{}", parse_options.file_name, virtual_extension),
+        original_text: content.to_string(),
+        span_map: Some(mappings),
+        diagnostic_directives,
+        supplemental_source_files: Vec::new(),
+        canonical_source_file: None,
+    });
+    Ok(SourceFiles {
+        canonical: Some(source_file),
+        supplemental: Vec::new(),
+    })
 }
 
 // Go: contentmapper/transform.go:128 CheckSupplementalFileNameCollisions
