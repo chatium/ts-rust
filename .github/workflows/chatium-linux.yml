@@ -1,7 +1,8 @@
-# Builds the linux-x64 tsc of the @chatium/tsc-rs packages on a GitHub-hosted runner, as the build
-# job of release.yml does: static musl, non-PIE, jemalloc with bin/tsgo.rs JEMALLOC_CONF built in.
+# Builds the linux tsc of the @chatium/tsc-rs packages on GitHub-hosted runners, as the build job of
+# release.yml does: static musl, non-PIE, jemalloc with bin/tsgo.rs JEMALLOC_CONF built in. arm64
+# jemalloc assumes 64 KiB pages, so the tsc also runs on 16 and 64 KiB page kernels (as ruff and uv).
 # scripts/goport/chatium-pack.sh packs the packages from its artifact and a macOS build.
-name: Chatium linux-x64
+name: Chatium linux
 
 on:
   push:
@@ -19,7 +20,19 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            lg_page: 16
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     steps:
       # The fat-LTO build needs more disk and memory than a standard runner leaves free.
@@ -27,24 +40,28 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo swapoff -a || true
-          sudo fallocate -l 12G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
+          sudo mkdir -p /mnt && sudo fallocate -l 12G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
           df -h / /mnt && free -h
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
       - run: sudo apt-get update -q && sudo apt-get install -yq musl-tools
       - name: Build
+        env:
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.lg_page }}
         run: |
-          export CC_x86_64_unknown_linux_musl=musl-gcc
+          [[ -n $JEMALLOC_SYS_WITH_LG_PAGE ]] || unset JEMALLOC_SYS_WITH_LG_PAGE
+          target=${{ matrix.target }}
+          export "CC_${target//-/_}=musl-gcc"
           export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
           JEMALLOC_SYS_WITH_MALLOC_CONF=$(sed -n 's/^const JEMALLOC_CONF: &str = "\([^"]*\)";$/\1/p' crates/ts_goport/src/bin/tsgo.rs | head -1)
           [[ -n $JEMALLOC_SYS_WITH_MALLOC_CONF ]] || { echo "::error::no JEMALLOC_CONF in bin/tsgo.rs"; exit 1; }
           export JEMALLOC_SYS_WITH_MALLOC_CONF
-          cargo build --profile goport --locked -p ts_goport --bin tsgo --features noembed --target x86_64-unknown-linux-musl
+          cargo build --profile goport --locked -p ts_goport --bin tsgo --features noembed --target "$target"
           mkdir -p "$RUNNER_TEMP/out"
-          cp target/x86_64-unknown-linux-musl/goport/tsgo "$RUNNER_TEMP/out/tsc"
+          cp "target/$target/goport/tsgo" "$RUNNER_TEMP/out/tsc"
           git rev-parse HEAD > "$RUNNER_TEMP/out/COMMIT"
       - name: Check the tsc
         run: |
@@ -67,7 +84,7 @@ jobs:
           docker run --rm -v "$dir:/t:ro" alpine:3 /t/tsc --version
       - uses: actions/upload-artifact@v4
         with:
-          name: tsc-linux-x64
+          name: tsc-${{ matrix.platform }}
           path: |
             ${{ runner.temp }}/out/tsc
             ${{ runner.temp }}/out/COMMIT

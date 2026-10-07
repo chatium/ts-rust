@@ -32,8 +32,8 @@ ports (7.1.0-dev), not the npm version.
 
 ## Platforms
 
-- Linux x64 (static, any distribution)
-- macOS arm64
+- Linux x64 and arm64 (static, any distribution; arm64 with 4, 16 or 64 KiB pages)
+- macOS arm64 and x64
 
 ## Known problems
 
