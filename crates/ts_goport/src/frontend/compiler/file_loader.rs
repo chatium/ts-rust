@@ -93,10 +93,12 @@ pub struct FileLoader {
     pub content_mapper_failures: RefCell<FxHashMap<*const Mapper, i32>>,
     pub content_mapper_init_failed: RefCell<FxHashSet<*const Mapper>>,
     pub content_mapper_diagnostics: RefCell<Vec<Diagnostic>>,
-    /// What the parse workers transform the files of each mapper with, by
-    /// mapper identity (`concurrent_content_mapper_transform`).
+    /// What the parse workers transform the files of each mapper with
+    /// (`concurrent_content_mapper_transform`). Keyed as the maps above:
+    /// two mappers of one package and version have their own options, and
+    /// so their own project.
     // PORT: not in Go (see `FilesParser::prefetch_request`).
-    pub concurrent_transforms: RefCell<FxHashMap<String, Option<Arc<ConcurrentTransform>>>>,
+    pub concurrent_transforms: RefCell<FxHashMap<*const Mapper, Option<Arc<ConcurrentTransform>>>>,
     // ts#64299. PORT: Go `moduleResolutionErrorOnce` plus the error is an
     // `Option` that keeps the first error.
     pub module_resolution_error: RefCell<Option<GoError>>,
@@ -1241,8 +1243,8 @@ impl FileLoader {
         if self.content_mapper_unavailable(Some(&mapper)) {
             return None;
         }
-        let identity = mapper.identity();
-        if let Some(transform) = self.concurrent_transforms.borrow().get(&identity) {
+        let key = Rc::as_ptr(&mapper);
+        if let Some(transform) = self.concurrent_transforms.borrow().get(&key) {
             return transform.clone();
         }
         let transform = self
@@ -1252,7 +1254,7 @@ impl FileLoader {
             .and_then(|project| project.concurrent_transform(&mapper));
         self.concurrent_transforms
             .borrow_mut()
-            .insert(identity, transform.clone());
+            .insert(key, transform.clone());
         transform
     }
 
