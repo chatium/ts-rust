@@ -1,7 +1,6 @@
 # Builds the linux-x64 tsc of the @chatium/tsc-rs packages on a GitHub-hosted runner, as the build
 # job of release.yml does: static musl, non-PIE, jemalloc with bin/tsgo.rs JEMALLOC_CONF built in.
-# The packages are packed from its artifact and a macOS build (npm/pack.mjs --name @chatium/tsc-rs,
-# npm/chatium-tsc-rs-readme.md).
+# scripts/goport/chatium-pack.sh packs the packages from its artifact and a macOS build.
 name: Chatium linux-x64
 
 on:
