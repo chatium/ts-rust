@@ -1293,6 +1293,7 @@ const IPC_REMOTE_ERROR_PREFIX: &str = "ipc: remote error [";
 // or a write failed), which is where Go's read loop ends. A call that ends
 // with `ctx` or with the mapper's error response leaves the process open,
 // as in Go.
+#[derive(Clone)]
 struct ProcessConn {
     conn: Arc<MuxConn>,
     rwc: Arc<dyn ProcessExitState>,
@@ -1347,9 +1348,11 @@ impl ipc::Conn for ProcessConn {
 // PORT: not in Go, where the parse goroutines call `Project.Transform`. The
 // project is dispatch-thread state; this is what a parse worker needs to
 // transform a file of the project: the mapper's connection, which threads
-// can share (`MuxConn`), the project handle and what decoding needs.
+// can share (`MuxConn`), the project handle and what decoding needs. A
+// worker's call that fails because the connection ended closes the process,
+// as the loading thread's does (`ProcessConn`).
 pub struct ConcurrentTransform {
-    conn: Arc<MuxConn>,
+    conn: ProcessConn,
     project_handle: String,
     position_encoding: PositionEncoding,
     diagnostic_source: String,
@@ -1364,7 +1367,7 @@ impl ConcurrentTransform {
         content: &str,
     ) -> std::result::Result<Result, GoError> {
         let raw = ipc::Conn::call(
-            &*self.conn,
+            &self.conn,
             &context::background(),
             METHOD_TRANSFORM,
             Some(Box::new(TransformParams {
@@ -1826,7 +1829,7 @@ impl HostImpl {
         let (conn, position_encoding, diagnostic_source) = self.conn_for(mapper).ok()?;
         let process = conn.as_any()?.downcast_ref::<ProcessConn>()?;
         Some(Arc::new(ConcurrentTransform {
-            conn: process.conn.clone(),
+            conn: process.clone(),
             project_handle,
             position_encoding,
             diagnostic_source,
