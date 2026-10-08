@@ -258,11 +258,18 @@ impl Checker {
             self.produce_deferred_diagnostics();
             self.reported_unreachable_nodes.clear();
             self.source_file_links.get(source_file).type_checked = true;
-
-            // Effect-TS/tsgo patch 002: run Effect diagnostics after type checking.
-            crate::effect::after_check_source_file(ctx, self, source_file);
         }
-        if check_unused && !self.source_file_links.get(source_file).unused_checked {
+        // Effect-TS/tsgo patch 002 runs the Effect rules inside the block above, before the
+        // unused check. Their type queries can mark a symbol referenced (for example the
+        // parameter of a `x is T` type predicate), which hides TS6133. The port runs them
+        // once, after the unused check, so that check reads only the TypeScript references.
+        // A file with Effect rules always gets the unused check first. Without noUnusedLocals
+        // and noUnusedParameters, that check only adds suggestions. A standalone API process
+        // runs no Effect rules (`rulerunner::enabled_options`).
+        let run_effect = crate::effect::rulerunner::enabled_options(self.compiler_options)
+            .is_some()
+            && !self.source_file_links.get(source_file).effect_checked;
+        if (check_unused || run_effect) && !self.source_file_links.get(source_file).unused_checked {
             // The unused identifiers check relies on a full type check having first been performed
             if !with_source_file_info(source_file, |info| info.is_declaration_file)
                 && !self.is_canceled()
@@ -275,6 +282,13 @@ impl Checker {
                 self.check_unused_identifiers(&identifier_check_nodes);
             }
             self.source_file_links.get(source_file).unused_checked = true;
+        }
+        if run_effect {
+            // Set first as a guard, not a need: `get_relation_errors` checks a file only
+            // when `type_checked` is false, and every rule passes this file, which is
+            // already type checked here.
+            self.source_file_links.get(source_file).effect_checked = true;
+            crate::effect::after_check_source_file(ctx, self, source_file);
         }
         if self.is_canceled() {
             self.was_canceled = true;

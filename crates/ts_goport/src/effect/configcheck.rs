@@ -15,7 +15,9 @@ use crate::prelude::*;
 /// after `extends` is merged. `source_file` is the tsconfig file node (or nil).
 #[must_use]
 pub fn validate(options: &CompilerOptions, source_file: Node) -> Vec<Diagnostic> {
-    let Some(config) = options.effect.as_deref() else {
+    // PORT: a standalone API process reports no Effect diagnostics
+    // (`rulerunner::enabled_options`).
+    let Some(config) = crate::effect::rulerunner::enabled_options(options) else {
         return Vec::new();
     };
     if !diagnostics_enabled(Some(config)) {

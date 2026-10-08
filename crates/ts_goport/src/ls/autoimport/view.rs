@@ -311,6 +311,16 @@ impl View {
     // groups after the other groups (the common tsgo result: Hono goldens
     // poison no middleware in 240 of 296 sessions). `fixes` keeps the
     // insertion order, so the sort input and its ties do not change.
+    // The cache lives as long as the importing file is open, in Go too: a
+    // completion that computes only the augmentation (prefix `V` for
+    // `Vars`) poisons the declaring file for the later completions (Go
+    // every time when one file augments). When several files augment, Go
+    // merges a random last path on each bucket build (map order in
+    // buildProjectBucket), so a long session poisons a random set of them;
+    // goport always merges the last in program order. knownprob1 S3, the
+    // hono long plan at edit 440: Go gives "." to `requestId` in 7 of 13
+    // runs and to other middleware in some; goport poisons none, Go's whole
+    // answer in 3 of 10 runs (aispec1).
     pub fn get_completions(
         &self,
         ch: &mut Checker,

@@ -2,12 +2,13 @@
 //!
 //! PORT: threads. The host, its projects and its connections are
 //! dispatch-thread values (see the module comment in `mod.rs`): Go's
-//! `lifecycleMu`, `mu` and the timing atomics are dropped, and the maps are
-//! `RefCell`s. Go holds `mu` across some protocol calls; here each call runs
-//! with no map borrowed. The spawned process (`ProcessExitState`, an
-//! `ipc::ReadWriteCloser`) and the stderr logger are shared with other
-//! threads (the spawner's stderr pump, the context callbacks), so they use
-//! `Arc` and `Mutex`.
+//! `lifecycleMu` and `mu` are dropped, and the maps are `RefCell`s. Go holds
+//! `mu` across some protocol calls; here each call runs with no map
+//! borrowed. Other threads share the spawned process (`ProcessExitState`, an
+//! `ipc::ReadWriteCloser`), its connection (`MuxConn`, whose read loop runs
+//! on its own thread), the timing collector and the stderr logger, so these
+//! use `Arc`, `Mutex` and atomics. A parse worker sends the transform
+//! requests of an open project through a `ConcurrentTransform`.
 //!
 //! PORT: Go map iteration order is random. The host maps are `IndexMap`s in
 //! insertion order, so the order of the close calls is fixed.
@@ -31,7 +32,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::io::Write;
 use std::rc::Weak;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -815,7 +816,7 @@ pub struct HostImpl {
     cancel: CancelFunc,
     stop: AfterFuncStop,
     dial: DialFunc,
-    timing: Rc<TimingCollector>,
+    timing: Arc<TimingCollector>,
 
     diagnostic_locale: RefCell<Locale>,
 
@@ -859,35 +860,45 @@ struct MapperConn {
 // Go: contentmapper/hostimpl.go:260 operationTiming
 // PORT: Go `operationTiming` and `OperationTiming` (host.go) are both
 // `OperationTiming` in Rust; the unexported one is `OperationTimingImpl`.
-// Go's atomics are cells (dispatch thread).
+// The parse workers record transforms too (`ConcurrentTransform`), so the
+// collectors keep Go's atomics and mutex.
 #[derive(Default)]
 struct OperationTimingImpl {
-    count: Cell<u64>,
-    duration: Cell<Duration>,
+    count: AtomicU64,
+    /// Nanoseconds (Go `atomic.Int64` of a `time.Duration`).
+    duration: AtomicU64,
 }
 
 impl OperationTimingImpl {
     // Go: contentmapper/hostimpl.go:265 operationTiming.record
     fn record(&self, start: Instant) {
-        self.count.set(self.count.get() + 1);
-        self.duration.set(self.duration.get() + start.elapsed());
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.duration.fetch_add(
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     // Go: contentmapper/hostimpl.go:270 operationTiming.snapshot
     fn snapshot(&self) -> OperationTiming {
         OperationTiming {
-            count: self.count.get(),
-            duration: self.duration.get(),
+            count: self.count.load(Ordering::Relaxed),
+            duration: Duration::from_nanos(self.duration.load(Ordering::Relaxed)),
         }
     }
 }
 
 // Go: contentmapper/hostimpl.go:274 timingCollector
 struct TimingCollector {
-    mappers: RefCell<IndexMap<String, Rc<MapperTimingCollector>>>,
-    active_requests: Cell<u64>,
-    request_wait_start: Cell<Instant>,
-    request_wait_elapsed: Cell<Duration>,
+    mu: Mutex<TimingState>,
+}
+
+/// The fields of Go `timingCollector` that its `mu` guards.
+struct TimingState {
+    mappers: IndexMap<String, Arc<MapperTimingCollector>>,
+    active_requests: u64,
+    request_wait_start: Instant,
+    request_wait_elapsed: Duration,
 }
 
 // Go: contentmapper/hostimpl.go:282 mapperTimingCollector
@@ -900,47 +911,46 @@ struct MapperTimingCollector {
     open_project: OperationTimingImpl,
     close_project: OperationTimingImpl,
     transform: OperationTimingImpl,
-    owner: Weak<TimingCollector>,
+    owner: std::sync::Weak<TimingCollector>,
 }
 
 impl TimingCollector {
     /// Go `&timingCollector{mappers: make(map[string]*mapperTimingCollector)}`.
     fn new() -> TimingCollector {
         TimingCollector {
-            mappers: RefCell::new(IndexMap::new()),
-            active_requests: Cell::new(0),
-            request_wait_start: Cell::new(Instant::now()),
-            request_wait_elapsed: Cell::new(Duration::ZERO),
+            mu: Mutex::new(TimingState {
+                mappers: IndexMap::new(),
+                active_requests: 0,
+                request_wait_start: Instant::now(),
+                request_wait_elapsed: Duration::ZERO,
+            }),
         }
     }
 
     // Go: contentmapper/hostimpl.go:291 timingCollector.mapper
-    fn mapper(self: &Rc<Self>, identity: &str) -> Rc<MapperTimingCollector> {
-        if let Some(timing) = self.mappers.borrow().get(identity) {
+    fn mapper(self: &Arc<Self>, identity: &str) -> Arc<MapperTimingCollector> {
+        let mut state = lock(&self.mu);
+        if let Some(timing) = state.mappers.get(identity) {
             return timing.clone();
         }
-        let timing = Rc::new(MapperTimingCollector {
-            owner: Rc::downgrade(self),
+        let timing = Arc::new(MapperTimingCollector {
+            owner: Arc::downgrade(self),
             ..Default::default()
         });
-        self.mappers
-            .borrow_mut()
-            .insert(identity.to_string(), timing.clone());
+        state.mappers.insert(identity.to_string(), timing.clone());
         timing
     }
 
     // Go: contentmapper/hostimpl.go:302 timingCollector.snapshot
     fn snapshot(&self) -> Timings {
-        let mut request_wait = self.request_wait_elapsed.get();
-        if self.active_requests.get() != 0 {
-            request_wait += self.request_wait_start.get().elapsed();
-        }
-        let mappers: Vec<(String, Rc<MapperTimingCollector>)> = self
-            .mappers
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let (request_wait, mappers) = {
+            let state = lock(&self.mu);
+            let mut request_wait = state.request_wait_elapsed;
+            if state.active_requests != 0 {
+                request_wait += state.request_wait_start.elapsed();
+            }
+            (request_wait, state.mappers.clone())
+        };
         let mut result = Timings {
             mappers: IndexMap::with_capacity(mappers.len()),
             request_wait,
@@ -962,7 +972,7 @@ impl TimingCollector {
 }
 
 impl MapperTimingCollector {
-    fn owner(&self) -> Rc<TimingCollector> {
+    fn owner(&self) -> Arc<TimingCollector> {
         self.owner
             .upgrade()
             .expect("content mapper timing collector outlives its host")
@@ -971,10 +981,12 @@ impl MapperTimingCollector {
     // Go: contentmapper/hostimpl.go:324 mapperTimingCollector.startRequest
     fn start_request(&self) -> Instant {
         let owner = self.owner();
-        if owner.active_requests.get() == 0 {
-            owner.request_wait_start.set(Instant::now());
+        let mut state = lock(&owner.mu);
+        if state.active_requests == 0 {
+            state.request_wait_start = Instant::now();
         }
-        owner.active_requests.set(owner.active_requests.get() + 1);
+        state.active_requests += 1;
+        drop(state);
         Instant::now()
     }
 
@@ -982,11 +994,11 @@ impl MapperTimingCollector {
     fn finish_request(&self, operation: &OperationTimingImpl, start: Instant) {
         operation.record(start);
         let owner = self.owner();
-        owner.active_requests.set(owner.active_requests.get() - 1);
-        if owner.active_requests.get() == 0 {
-            owner
-                .request_wait_elapsed
-                .set(owner.request_wait_elapsed.get() + owner.request_wait_start.get().elapsed());
+        let mut state = lock(&owner.mu);
+        state.active_requests -= 1;
+        if state.active_requests == 0 {
+            let elapsed = state.request_wait_start.elapsed();
+            state.request_wait_elapsed += elapsed;
         }
     }
 }
@@ -1300,6 +1312,21 @@ struct ProcessConn {
 }
 
 impl ProcessConn {
+    /// `MuxConn::call`, then the process close of a call that failed
+    /// because the connection ended. Any thread can call it.
+    fn call_any_thread(
+        &self,
+        ctx: &Context,
+        method: &str,
+        params: Option<Box<dyn AnyValue>>,
+    ) -> std::result::Result<JsonValue, GoError> {
+        let result = ipc::Conn::call(&*self.conn, ctx, method, params);
+        if let Err(err) = &result {
+            self.close_if_ended(ctx, err);
+        }
+        result
+    }
+
     fn close_if_ended(&self, ctx: &Context, err: &GoError) {
         if ctx.err().is_none() && !err.error().starts_with(IPC_REMOTE_ERROR_PREFIX) {
             let _ = self.rwc.close();
@@ -1314,15 +1341,19 @@ impl ipc::Conn for ProcessConn {
         result
     }
 
+    // PORT: a panic of the read loop ends the process in Go. Here it
+    // panics on the loading thread, in the first call after it.
     fn call(
         &self,
         ctx: &Context,
         method: &str,
         params: Option<Box<dyn AnyValue>>,
     ) -> std::result::Result<JsonValue, GoError> {
-        let result = ipc::Conn::call(&*self.conn, ctx, method, params);
-        if let Err(err) = &result {
-            self.close_if_ended(ctx, err);
+        let result = self.call_any_thread(ctx, method, params);
+        if result.is_err()
+            && let Some(payload) = self.conn.take_read_panic()
+        {
+            std::panic::resume_unwind(payload);
         }
         result
     }
@@ -1345,43 +1376,76 @@ impl ipc::Conn for ProcessConn {
     }
 }
 
-// PORT: not in Go, where the parse goroutines call `Project.Transform`. The
-// project is dispatch-thread state; this is what a parse worker needs to
-// transform a file of the project: the mapper's connection, which threads
-// can share (`MuxConn`), the project handle and what decoding needs. A
-// worker's call that fails because the connection ended closes the process,
-// as the loading thread's does (`ProcessConn`).
+// PORT: not in Go, where the parse goroutines call `projectLease.Transform`
+// (hostimpl.go:1000) on an open project. The project is dispatch-thread
+// state; this is what a parse worker needs to send the transform request of
+// a file of an open project, as `transform_locked` does: the mapper's
+// connection, which threads can share (`MuxConn`), the project handle, the
+// host context, the timing and what decoding needs. The loader disables it
+// when the mapper fails (`disable`), so that the workers send no more.
 pub struct ConcurrentTransform {
     conn: ProcessConn,
+    ctx: Context,
     project_handle: String,
     position_encoding: PositionEncoding,
     diagnostic_source: String,
+    timing: Arc<MapperTimingCollector>,
+    disabled: AtomicBool,
 }
 
 impl ConcurrentTransform {
-    /// The mapper's result for `content` of `file_name`, as
-    /// `Project::transform` decodes it.
+    /// The transform of `content` of `file_name`, as `transform_locked`
+    /// makes it, errors and timings included. `None` when the mapper is
+    /// disabled, or when the connection's read loop panicked: then the
+    /// loader transforms the file itself, and its call panics.
+    // Go: contentmapper/hostimpl.go:770 host.transformLocked
     pub fn transform(
         &self,
         file_name: &str,
         content: &str,
-    ) -> std::result::Result<Result, GoError> {
-        let raw = ipc::Conn::call(
-            &self.conn,
-            &context::background(),
+    ) -> Option<std::result::Result<Result, GoError>> {
+        if self.disabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let start = self.timing.start_request();
+        let raw = self.conn.call_any_thread(
+            &self.ctx,
             METHOD_TRANSFORM,
             Some(Box::new(TransformParams {
                 file_name: file_name.to_string(),
                 content: content.to_string(),
                 project_handle: self.project_handle.clone(),
             })),
-        )?;
-        decode_transform_result(
-            &raw,
-            content,
-            &self.position_encoding,
-            &self.diagnostic_source,
+        );
+        self.timing.finish_request(&self.timing.transform, start);
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(_) if self.conn.conn.read_panicked() => return None,
+            Err(err) => {
+                return Some(Err(new_transform_error(
+                    TransformErrorKind::REQUEST,
+                    Some(err),
+                )
+                .to_go_error()));
+            }
+        };
+        Some(
+            decode_transform_result(
+                &raw,
+                content,
+                &self.position_encoding,
+                &self.diagnostic_source,
+            )
+            .map_err(|err| {
+                new_transform_error(TransformErrorKind::RESPONSE, Some(err)).to_go_error()
+            }),
         )
+    }
+
+    /// Stops the transforms that the workers start after this: the loader
+    /// disabled the mapper (`FileLoader::content_mapper_unavailable`).
+    pub fn disable(&self) {
+        self.disabled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1407,7 +1471,7 @@ pub fn new_host_with_options(
     options: HostOptions,
 ) -> Rc<dyn Host> {
     let logger = options.logger;
-    let timing = Rc::new(TimingCollector::new());
+    let timing = Arc::new(TimingCollector::new());
     let dial_timing = timing.clone();
     let dial: DialFunc = Rc::new(
         move |ctx: &Context, mapper: &Rc<Mapper>, diagnostic_locale: &Locale| {
@@ -1481,28 +1545,13 @@ pub fn new_host_with_options(
             // Go starts the read loop here (`go conn.Run(ctx)`); `MuxConn`
             // starts its reader thread.
             let conn: Rc<dyn ipc::Conn> = Rc::new(ProcessConn {
-                conn: MuxConn::start(new_protocol),
+                conn: MuxConn::start(new_protocol, Arc::new(RejectHandler)),
                 rwc: rwc.clone(),
             });
             let (initialize_ctx, cancel) = context::with_timeout(ctx, INITIALIZE_TIMEOUT);
-            // PORT: Go's `Call` returns at the deadline while its read
-            // goroutine keeps waiting. The ipc port reads inside the call, so
-            // at the deadline this closes the process to end the read. Go
-            // reports that case as no response, before it looks at the exit
-            // state, and so does the check below.
-            let closed_at_deadline = Arc::new(AtomicBool::new(false));
-            let stop_deadline_close = {
-                let rwc = rwc.clone();
-                let closed_at_deadline = closed_at_deadline.clone();
-                context::after_func(&initialize_ctx, move || {
-                    closed_at_deadline.store(true, Ordering::SeqCst);
-                    let _ = rwc.close();
-                })
-            };
             let initialize_start = mapper_timing.start_request();
             let handshake_result = handshake(&initialize_ctx, &conn, diagnostic_locale);
             mapper_timing.finish_request(&mapper_timing.initialize, initialize_start);
-            stop_deadline_close();
             let initialize_ctx_err = initialize_ctx.err();
             cancel();
             match handshake_result {
@@ -1517,15 +1566,6 @@ pub fn new_host_with_options(
                         // error is `err` itself, so the port returns a copy.
                         initialize_error.mapper_name = diagnostic_name;
                         return Err(initialize_error.to_go_error());
-                    }
-                    if closed_at_deadline.load(Ordering::SeqCst) {
-                        return Err(InitializeError {
-                            kind: InitializeErrorKind::NO_RESPONSE,
-                            mapper_name: diagnostic_name,
-                            timeout_seconds: INITIALIZE_TIMEOUT_SECONDS,
-                            ..Default::default()
-                        }
-                        .to_go_error());
                     }
                     if exited {
                         return Err(InitializeError {
@@ -1571,7 +1611,7 @@ pub fn new_host_with_options(
 fn new_with_dial(
     ctx: &Context,
     diagnostic_locale: Locale,
-    timing: Rc<TimingCollector>,
+    timing: Arc<TimingCollector>,
     dial: DialFunc,
 ) -> Rc<HostImpl> {
     let (host_ctx, cancel) = context::with_cancel(ctx);
@@ -1816,23 +1856,40 @@ impl HostImpl {
         self.conn_for_locked(mapper)
     }
 
-    // PORT: not in Go (see `ConcurrentTransform`). `None` when the mapper
-    // has no process connection (it failed to start, or a test dialer).
+    // PORT: not in Go (see `ConcurrentTransform`). What a parse worker can
+    // send the transforms of the project of `entry` with, once the project
+    // is open. `None` before (Go opens it on the first transform, here the
+    // loader's), and when the mapper's connection is not a process
+    // connection (a test dialer). It never dials.
     fn concurrent_transform(
         &self,
         mapper: &Rc<Mapper>,
-        project_handle: String,
+        entry: &Rc<RefCell<ProjectEntry>>,
     ) -> Option<Arc<ConcurrentTransform>> {
-        if project_handle.is_empty() {
-            return None;
-        }
-        let (conn, position_encoding, diagnostic_source) = self.conn_for(mapper).ok()?;
-        let process = conn.as_any()?.downcast_ref::<ProcessConn>()?;
+        let project_handle = {
+            let entry = entry.borrow();
+            if !entry.opened || entry.project_handle.is_empty() {
+                return None;
+            }
+            entry.project_handle.clone()
+        };
+        let identity = mapper.identity();
+        let conn = self.conns.borrow().as_ref()?.get(&identity)?.clone();
+        let conn = conn.borrow();
+        let process = conn
+            .conn
+            .as_ref()?
+            .as_any()?
+            .downcast_ref::<ProcessConn>()?
+            .clone();
         Some(Arc::new(ConcurrentTransform {
-            conn: process.clone(),
+            conn: process,
+            ctx: self.ctx.clone(),
             project_handle,
-            position_encoding,
-            diagnostic_source,
+            position_encoding: conn.position_encoding.clone(),
+            diagnostic_source: conn.diagnostic_source.clone(),
+            timing: self.timing.mapper(&identity),
+            disabled: AtomicBool::new(false),
         }))
     }
 
@@ -2417,14 +2474,11 @@ impl Project for ProjectLease {
         host.transform_locked(mapper, request, &handle)
     }
 
+    // PORT: not in Go (see `ConcurrentTransform`).
     fn concurrent_transform(&self, mapper: &Rc<Mapper>) -> Option<Arc<ConcurrentTransform>> {
         let host = &self.host;
-        let key = self.entry_key(mapper).cloned().unwrap_or_default();
-        let entry = host.project_entry(&key)?;
-        // An open that fails here fails again in `transform`, which reports it.
-        host.open_project_locked(&host.ctx, &entry).ok()?;
-        let handle = entry.borrow().project_handle.clone();
-        host.concurrent_transform(mapper, handle)
+        let entry = host.project_entry(self.entry_key(mapper)?)?;
+        host.concurrent_transform(mapper, &entry)
     }
 
     // Go: contentmapper/hostimpl.go:1021 projectLease.Close

@@ -18,7 +18,7 @@ rc=0
 # Same LAN route and host key as remote.sh.
 ssh_opts=()
 case $HOST in
-  mini-743d) ssh_opts=(-e "ssh -o HostName=mini-743d.local -o HostKeyAlias=$(ssh -G mini-743d | awk '$1 == "hostname" { print $2 }')") ;;
+  mini-743d) ssh_opts=(-e "ssh -o HostName=mini-743d.local -o HostKeyAlias=$(ssh -G mini-743d 2> /dev/null | awk '$1 == "hostname" { print $2 }')") ;;
   mini-abf9) echo "mini-abf9 is Theo's machine since 2026-10-04. Do not use it." >&2; exit 2 ;;
 esac
 if [[ $S == setup ]]; then

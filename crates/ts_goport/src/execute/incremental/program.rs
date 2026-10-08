@@ -151,7 +151,10 @@ pub fn build_info_program(
     build_info: &BuildInfo,
     host: &dyn CompilerHost,
 ) -> Option<Program> {
-    if !build_info.is_valid_version() || !build_info.is_incremental() {
+    if !build_info.is_valid_version(
+        crate::effect::rulerunner::enabled_options(config.compiler_options()).is_some(),
+    ) || !build_info.is_incremental()
+    {
         return None;
     }
     // If any configured content mapper's identity has changed, files it produced may be stale, so the
@@ -451,32 +454,59 @@ impl Program {
     }
 
     /// PORT: not in Go (perf). After `start_check`: when the options allow
-    /// an early emit (`early_emit_options_allow`), `start_check` sent a
-    /// check and the check cannot see the outputs
+    /// an early emit (`early_emit_options_allow`), Go emits (no
+    /// `--listFilesOnly`) and the check cannot see the outputs
     /// (`check_cannot_see_outputs`), sends the rest of the checker work of
     /// `tsc.EmitFilesAndReportErrors` without a wait: the emit of the
     /// affected files with `options` (`start_emit_files`; since ts#64452 Go
     /// reads no global diagnostics after the check of an incremental
-    /// program). Else it does nothing. `start_check_and_emit`
-    /// (`tsc -p`) calls it. `tsc -b` calls it right after `start_check` in
+    /// program). Else it does nothing. `start_check_and_emit` (`tsc -p`)
+    /// calls it. `tsc -b` calls it right after `start_check` in
     /// `BuildTask::compile_and_emit_start`, inside
     /// `buffer_early_emit_writes`, so the writes wait for the task's
     /// `compile_and_emit_finish`. In tests `tsc -b` calls it in
     /// `BuildTask::compile_and_emit_finish`, right before
     /// `EmitAndReportStatistics`.
+    ///
+    /// The emit starts also when `start_check` sent no check. Then Go's
+    /// task only emits (tscbemit1, tscbemit2): every program file has
+    /// cached semantic diagnostics, so
+    /// `collectSemanticDiagnosticsOfAffectedFiles` returns before a check;
+    /// or `GetDiagnosticsOfAnyProgram` skips the semantic diagnostics
+    /// (syntactic, program or global diagnostics); or they are empty
+    /// (`noCheck`). The emit is then the program's only
+    /// checker work, and `tsc -b` finishes the task when that emit ends
+    /// (`BuildTask::notify_when_compiled`), as Go's task goroutine writes
+    /// when its own emit ends. Without it, the emit ran in
+    /// `compile_and_emit_finish` and such tasks finished in build order.
+    ///
+    /// Go reads the global diagnostics before the emit whenever the
+    /// syntactic diagnostics are empty, also with `noCheck` or program
+    /// diagnostics, where `start_check` returns before it reads them. The
+    /// affected-file walk and the emit can add global diagnostics (Go's
+    /// "incidental signature-generation globals"), so this reads them
+    /// first, after the program diagnostics, as `start_check` does. The
+    /// next `get_global_diagnostics` call takes them.
     pub fn start_emit(&self, options: EmitOptions) {
         debug_assert!(
             self.started.borrow().emit.is_none(),
             "start_emit: the emit already started"
         );
         // The file rules read every program file: the checkers check
-        // meanwhile.
+        // meanwhile (when a check started).
         if !early_emit_options_allow()
-            || self.started.borrow().check.is_none()
+            || self.options().list_files_only.is_true()
             || !self.snapshot.borrow().can_use_incremental_state()
             || !check_cannot_see_outputs()
         {
             return;
+        }
+        if self.started.borrow().global_diagnostics.is_none()
+            && get_syntactic_diagnostics(Node::NIL).is_empty()
+        {
+            get_program_diagnostics();
+            let global_diagnostics = get_global_diagnostics();
+            self.started.borrow_mut().global_diagnostics = Some(global_diagnostics);
         }
         let emit = start_emit_files(self, options);
         self.started.borrow_mut().emit = Some(emit);

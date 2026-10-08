@@ -14,8 +14,8 @@
 //! `background::TaskHold` until its timer has run. `WaitForBackgroundTasks`
 //! drains `gostd::local` through `Queue::wait`. The one exception is the
 //! clone of the auto-import warm, which is `gostd::local` idle work: the
-//! LSP server runs it only after a quiet period with no message, and the
-//! reader thread can cancel it (`WarmAutoImportPreempt`).
+//! LSP server runs it only when no message waits, and the reader thread can
+//! cancel it or make it yield (`WarmAutoImportPreempt`).
 //!
 //! Go runtime metrics (`runtime/metrics`) exist only in the Go runtime.
 //! Performance telemetry reads them as `KindBad` (`metrics_read`), so its
@@ -27,7 +27,7 @@ use crate::project::prelude::*;
 
 use crate::contentmapper;
 use std::cell::Cell;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 // Go: project/session.go:36 UpdateReason
@@ -195,6 +195,11 @@ pub struct Session {
     // `warm_auto_import_cache`), and whether an idle job for it is queued.
     pub warm_auto_import_pending: RefCell<Option<PendingWarm>>,
     pub warm_auto_import_queued: Cell<bool>,
+    // PORT: set when an eager attempt of the warm ends without its clone or
+    // a clone takes longer than `WARM_AUTO_IMPORT_HOLD_CAP`, cleared when a
+    // clone ends sooner. While it is set, a warm waits for a quiet period
+    // (see `run_pending_warm`).
+    pub warm_auto_import_slow: Cell<bool>,
 
     // idleCacheCleanTimer is a resettable timer for scheduling idle disk
     // cache cleans. The timer resets on any file event (open, close,
@@ -294,6 +299,7 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
         warm_auto_import_preempt: WarmAutoImportPreempt::default(),
         warm_auto_import_pending: RefCell::new(None),
         warm_auto_import_queued: Cell::new(false),
+        warm_auto_import_slow: Cell::new(false),
         idle_cache_clean_timer: RefCell::new(None),
         performance_telemetry_cancel: RefCell::new(None),
         seen_projects: RefCell::new(FxHashSet::default()),
@@ -912,33 +918,83 @@ pub struct PendingWarm {
     new_snapshot: Rc<Snapshot>,
     /// The id that Go's clone takes when the warm starts.
     snapshot_id: u64,
+    /// For an eager attempt (it starts as soon as no message waits): the
+    /// time from which the attempt's hold counts (see `run_pending_warm`).
+    /// `None` for an attempt that waits for a quiet period.
+    hold_from: Option<Instant>,
+    /// Whether an attempt yielded before (see `run_pending_warm`).
+    retry: bool,
 }
 
-/// PORT: cancels the auto-import warm from the LSP reader thread.
+/// PORT: the longest time that a message waits for an eager attempt of the
+/// auto-import warm (see `run_pending_warm`). Go's head start is about 2 ms
+/// in the lswarm1 repros.
+pub const WARM_AUTO_IMPORT_HOLD_CAP: Duration = Duration::from_millis(5);
+
+/// PORT: how a clone attempt of the auto-import warm ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WarmAttemptEnd {
+    /// The clone ended. Go adopts it.
+    Done,
+    /// The warm was cancelled (Go `warmCtx`). Go discards the clone.
+    Cancelled,
+    /// Only the attempt was cancelled: a message did not wait for it. The
+    /// warm tries again.
+    Yielded,
+}
+
+/// PORT: lets the LSP reader thread cancel the auto-import warm, or make it
+/// wait or yield.
 ///
 /// Go runs the warm on a goroutine, and the dispatch goroutine cancels it
 /// when it handles didOpen, didChange, didClose or didChangeWatchedFiles.
-/// Here the warm runs on the dispatch thread, so the dispatch thread cannot
-/// get to those messages until the warm ends. The reader thread calls
-/// `cancel` when one of them arrives, and the warm stops at its next
-/// context check. The handler's own `cancel_warm_auto_import_cache` then
-/// finds the warm done, as Go's does when the warm has ended.
+/// Other messages run at the same time as the warm. Here the clone runs on
+/// the dispatch thread (`Session::run_pending_warm`), so the dispatch thread
+/// cannot get to a message until the clone ends. The reader thread calls
+/// `on_message` for each message that it queues:
+///
+/// - While an eager attempt runs, the message first waits up to the
+///   attempt's hold for the clone to end (Go's head start).
+/// - Then a file event cancels the warm, and the warm stops at its next
+///   context check. The handler's own `cancel_warm_auto_import_cache` then
+///   finds the warm done, as Go's does when the warm has ended.
+/// - Any other message yields an eager attempt: the clone stops at its next
+///   context check and the warm tries again later. During an attempt that
+///   is not eager, such a message waits for the whole clone.
 ///
 /// It holds the same context and cancel function as
-/// `Session::warm_auto_import_cancel`, and is set and cleared with it.
+/// `Session::warm_auto_import_cancel`, and is set and cleared with it. One
+/// mutex covers the warm, its attempt and the queueing of a message, so an
+/// attempt does not start while a message waits (`set_busy`), and after an
+/// attempt ends the reader neither cancels nor yields it.
 #[derive(Clone, Default)]
-pub struct WarmAutoImportPreempt(Arc<Mutex<Option<WarmAutoImportPreemptEntry>>>);
+pub struct WarmAutoImportPreempt(Arc<WarmAutoImportPreemptShared>);
+
+#[derive(Default)]
+struct WarmAutoImportPreemptShared {
+    entry: Mutex<Option<WarmAutoImportPreemptEntry>>,
+    /// Signalled when an attempt ends.
+    attempt_ended: Condvar,
+    /// Whether a message waits for the dispatch thread (`set_busy`).
+    busy: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+}
 
 struct WarmAutoImportPreemptEntry {
     ctx: Context,
     cancel: gostd::context::CancelFunc,
     file_name: String,
+    /// The clone attempt that runs now: its cancel function and its hold
+    /// (`None` when it is not eager).
+    attempt: Option<(gostd::context::CancelFunc, Option<Duration>)>,
+    /// Whether the clone ended. Go's warm has then ended, and its cancel
+    /// does nothing.
+    done: bool,
 }
 
 impl WarmAutoImportPreempt {
     fn entry(&self) -> MutexGuard<'_, Option<WarmAutoImportPreemptEntry>> {
         // PORT: Go mutexes do not poison.
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.0.entry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn set(&self, ctx: Context, cancel: gostd::context::CancelFunc, file_name: String) {
@@ -946,6 +1002,8 @@ impl WarmAutoImportPreempt {
             ctx,
             cancel,
             file_name,
+            attempt: None,
+            done: false,
         });
     }
 
@@ -953,13 +1011,23 @@ impl WarmAutoImportPreempt {
         *self.entry() = None;
     }
 
+    /// Sets the check that a message waits for the dispatch thread (the LSP
+    /// server's request queue). An attempt does not start while it is true.
+    pub fn set_busy(&self, busy: Box<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.0.busy.set(busy);
+    }
+
     /// Go `cancelWarmAutoImportCache`, with the log line of the stored
     /// cancel function. Safe to call from any thread.
     pub fn cancel(&self, logger: &dyn logging::Logger) {
-        let Some(entry) = self.entry().take() else {
+        Self::cancel_entry(&mut self.entry(), logger);
+    }
+
+    fn cancel_entry(entry: &mut Option<WarmAutoImportPreemptEntry>, logger: &dyn logging::Logger) {
+        let Some(entry) = entry.take() else {
             return;
         };
-        if entry.ctx.err().is_some() {
+        if entry.done || entry.ctx.err().is_some() {
             return;
         }
         logger.logf(&format!(
@@ -967,6 +1035,80 @@ impl WarmAutoImportPreempt {
             entry.file_name
         ));
         (entry.cancel)();
+    }
+
+    /// The LSP reader thread calls this for each message that it queues for
+    /// the dispatch thread, with `queue`, which queues it. `file_event`: the
+    /// message's Go handler cancels the warm. See the type doc.
+    pub fn on_message<R>(
+        &self,
+        file_event: bool,
+        logger: &dyn logging::Logger,
+        queue: impl FnOnce() -> R,
+    ) -> R {
+        let mut entry = self.entry();
+        let hold = entry
+            .as_ref()
+            .and_then(|e| e.attempt.as_ref())
+            .and_then(|(_, hold)| *hold);
+        let Some(hold) = hold else {
+            if file_event {
+                Self::cancel_entry(&mut entry, logger);
+            }
+            return queue();
+        };
+        let result = queue();
+        let deadline = Instant::now() + hold;
+        loop {
+            let now = Instant::now();
+            if now >= deadline || entry.as_ref().is_none_or(|e| e.attempt.is_none()) {
+                break;
+            }
+            entry = self
+                .0
+                .attempt_ended
+                .wait_timeout(entry, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        if file_event {
+            Self::cancel_entry(&mut entry, logger);
+        } else if let Some((yield_attempt, Some(_))) =
+            entry.as_ref().and_then(|e| e.attempt.as_ref())
+        {
+            yield_attempt();
+        }
+        result
+    }
+
+    /// Starts a clone attempt, unless a message waits.
+    fn start_attempt(&self, cancel: gostd::context::CancelFunc, hold: Option<Duration>) -> bool {
+        let mut entry = self.entry();
+        if self.0.busy.get().is_some_and(|busy| busy()) {
+            return false;
+        }
+        if let Some(entry) = entry.as_mut() {
+            entry.attempt = Some((cancel, hold));
+        }
+        true
+    }
+
+    /// Ends the clone attempt that runs, and says how it ended.
+    fn end_attempt(&self, warm_ctx: &Context, attempt_ctx: &Context) -> WarmAttemptEnd {
+        let mut entry = self.entry();
+        let end = if warm_ctx.err().is_some() {
+            WarmAttemptEnd::Cancelled
+        } else if attempt_ctx.err().is_some() {
+            WarmAttemptEnd::Yielded
+        } else {
+            WarmAttemptEnd::Done
+        };
+        if let Some(entry) = entry.as_mut() {
+            entry.attempt = None;
+            entry.done = end == WarmAttemptEnd::Done;
+        }
+        self.0.attempt_ended.notify_all();
+        end
     }
 }
 
@@ -2259,6 +2401,8 @@ impl Session {
             };
         self.background_queue
             .enqueue(&self.background_context(), move |ctx| {
+                // PORT: for the hold of the warm (see `run_pending_warm`).
+                let task_start = Instant::now();
                 let _program_holds = program_holds;
                 let old_snapshot = &task_old_snapshot;
                 let new_snapshot = &task_new_snapshot;
@@ -2284,7 +2428,7 @@ impl Session {
                 let _ = s.update_content_mapper_registrations(ctx, new_snapshot);
                 s.publish_program_diagnostics(old_snapshot, new_snapshot);
                 s.send_project_info_telemetry_for_new_projects(old_snapshot, new_snapshot);
-                s.warm_auto_import_cache(ctx, &change, old_snapshot, new_snapshot);
+                s.warm_auto_import_cache(ctx, &change, old_snapshot, new_snapshot, task_start);
             });
 
         Some(new_snapshot)
@@ -2358,7 +2502,7 @@ impl Session {
     // queue's tasks have finished, including the debounced ones, which
     // count until their timer has run. The auto-import warm clone is idle work
     // (see `warm_auto_import_cache`); Go waits for it as part of its task,
-    // so this runs the idle work too.
+    // so this runs the idle work too, retries included.
     pub fn wait_for_background_tasks(&self) {
         self.cancel_idle_cache_clean();
         self.background_queue.wait();
@@ -3445,23 +3589,26 @@ impl Session {
     //
     // PORT: the clone (the export extraction, which can take hundreds of
     // ms) runs as idle work (`gostd::local::go_idle`, `run_pending_warm`),
-    // after the checks and the cancel setup that Go does first. The LSP
-    // dispatch loop starts it only after a quiet period with no message, so
-    // a request does not wait for it. Go runs the whole warm on a goroutine.
-    // A file event or a newer warm cancels the context before or during the
-    // clone (`WarmAutoImportPreempt`). A clone that has started runs to its
-    // next cancel point, and its result is discarded, as Go's is. Its
-    // registry build has more cancel points than Go's
+    // after the checks and the cancel setup that Go does first. Go runs the
+    // whole warm on a goroutine, so a request never waits for it. The LSP
+    // dispatch loop starts the clone only when no message waits, and the
+    // reader thread makes a message wait for it only up to a short hold
+    // (`run_pending_warm`). A file event or a newer warm cancels the context
+    // before or during the clone (`WarmAutoImportPreempt`). A clone that has
+    // started runs to its next cancel point, and its result is discarded,
+    // as Go's is. Its registry build has more cancel points than Go's
     // (`autoimport::registry::DISCARD_ON_CANCEL_KEY`). A clone that has not
     // started is skipped: Go's would run and be discarded, and the only
     // trace it leaves is its snapshot id, which is taken here, where Go's
-    // clone takes it.
+    // clone takes it. `task_start` is when the background task that calls
+    // this started.
     pub fn warm_auto_import_cache(
         self: &Rc<Self>,
         ctx: &Context,
         change: &SnapshotChange,
         _old_snapshot: &Rc<Snapshot>,
         new_snapshot: &Rc<Snapshot>,
+        task_start: Instant,
     ) {
         if change.file_changes.changed.len() == 1 {
             let mut changed_file = lsproto::DocumentUri::default();
@@ -3537,29 +3684,70 @@ impl Session {
             // PORT: Go's clone would take its snapshot id now.
             let snapshot_id = self.snapshot_id.get() + 1;
             self.snapshot_id.set(snapshot_id);
+            // PORT: Go's warm starts now, and the part of this task before
+            // it ran for `prefix`. The hold counts from `queued_at + prefix`
+            // (see `run_pending_warm`).
+            let queued_at = Instant::now();
+            let prefix = queued_at.saturating_duration_since(task_start);
             let warm = PendingWarm {
                 ctx: warm_ctx,
                 cancel,
                 changed_file,
                 new_snapshot: new_snapshot.clone(),
                 snapshot_id,
+                hold_from: (!self.warm_auto_import_slow.get()).then(|| queued_at + prefix),
+                retry: false,
             };
             // A pending warm here was cancelled above (`previous_cancel`).
             if let Some(previous) = self.warm_auto_import_pending.replace(Some(warm)) {
                 self.end_pending_warm(previous);
             }
-            if !self.warm_auto_import_queued.replace(true) {
-                let s = self.clone();
-                // Go: the rest of the same wg.Go goroutine.
-                gostd::local::go_idle(Box::new(move || {
-                    crate::core::go_wait_group_task(|| s.run_pending_warm())
-                }));
-            }
+            self.queue_pending_warm();
         }
     }
 
-    /// PORT: the part of Go `warmAutoImportCache` after `tryRef`, run as
-    /// idle work for the pending warm (see `warm_auto_import_cache`).
+    /// PORT: queues the idle job that runs the pending warm, unless one is
+    /// queued. An eager warm starts as soon as no message waits, others after
+    /// a quiet period.
+    fn queue_pending_warm(self: &Rc<Self>) {
+        let start = match self.warm_auto_import_pending.borrow().as_ref() {
+            Some(warm) if warm.hold_from.is_some() => gostd::local::IdleStart::AtOnce,
+            _ => gostd::local::IdleStart::AfterQuiet,
+        };
+        if !self.warm_auto_import_queued.replace(true) {
+            let s = self.clone();
+            // Go: the rest of the same wg.Go goroutine.
+            gostd::local::go_idle(
+                start,
+                Box::new(move || crate::core::go_wait_group_task(|| s.run_pending_warm())),
+            );
+        }
+    }
+
+    /// PORT: the part of Go `warmAutoImportCache` after `tryRef`: one clone
+    /// attempt, run as idle work for the pending warm (see
+    /// `warm_auto_import_cache`).
+    ///
+    /// Go's warm starts on a goroutine before the async part of the request
+    /// that made the snapshot, and survives if it ends before the next file
+    /// event: p + T_w < D + gap, where p is the part of the background task
+    /// before the warm (session.go:1397-1413), T_w the warm, D the async
+    /// part and gap the client's turnaround. The port runs p before the async
+    /// part, so its answer comes p later, and the clone runs only after the
+    /// answer. So the first attempt is eager: it starts as soon as no message
+    /// waits, and a message that comes during it waits up to its hold
+    /// h = D - p = (start - queued_at) - p, at most
+    /// `WARM_AUTO_IMPORT_HOLD_CAP` (`WarmAutoImportPreempt::on_message`).
+    /// Then a file event cancels the warm, and any other message yields the
+    /// attempt: the warm goes back to the pending slot and tries again after
+    /// a quiet period, when such a message waits for the whole clone, so the
+    /// warm cannot starve.
+    ///
+    /// An eager attempt that ends without its clone marks the session slow
+    /// (`warm_auto_import_slow`), and so does a clone that takes longer than
+    /// the hold can be. A clone that ends sooner clears the mark. While it is
+    /// set, a new warm also waits for a quiet period, so on a project whose
+    /// warm is long, a message pays the hold only before the first warm ends.
     pub fn run_pending_warm(self: &Rc<Self>) {
         self.warm_auto_import_queued.set(false);
         let Some(warm) = self.warm_auto_import_pending.take() else {
@@ -3569,57 +3757,104 @@ impl Session {
             self.end_pending_warm(warm);
             return;
         }
-        let PendingWarm {
-            ctx: warm_ctx,
-            cancel,
-            changed_file,
-            new_snapshot,
-            snapshot_id,
-        } = warm;
+        // Go's adopt (session.go:1311) discards the clone when the session
+        // has moved past its snapshot.
+        if warm.retry && !Rc::ptr_eq(&*self.snapshot.borrow(), &warm.new_snapshot) {
+            self.end_pending_warm(warm);
+            return;
+        }
+        let (attempt_ctx, attempt_cancel) = gostd::context::with_cancel(&warm.ctx);
+        let hold = warm.hold_from.map(|from| {
+            Instant::now()
+                .saturating_duration_since(from)
+                .min(WARM_AUTO_IMPORT_HOLD_CAP)
+        });
+        if !self
+            .warm_auto_import_preempt
+            .start_attempt(attempt_cancel.clone(), hold)
+        {
+            // A message came after the dispatch loop saw none. It goes first.
+            attempt_cancel();
+            self.put_back_warm(warm);
+            return;
+        }
 
         let warm_change = SnapshotChange {
             reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
             resource_request: ResourceRequest {
-                documents: vec![changed_file.clone()],
-                auto_imports: changed_file,
+                documents: vec![warm.changed_file.clone()],
+                auto_imports: warm.changed_file.clone(),
                 ..Default::default()
             },
             ..Default::default()
         };
-        // PORT: a cancelled warm drops its clone below (Go session.go:1844),
+        // PORT: a cancelled warm drops its clone below (Go session.go:2111),
         // so its registry build may stop at more points than Go's
         // (`autoimport::registry::DISCARD_ON_CANCEL_KEY`). `build_ctx` is a
-        // value child of `warm_ctx`, so it is cancelled exactly when
-        // `warm_ctx` is.
+        // value child of `attempt_ctx`, a child of `warm.ctx`, so it is
+        // cancelled exactly when one of them is.
         let build_ctx = gostd::context::with_value(
-            &warm_ctx,
+            &attempt_ctx,
             &crate::ls::autoimport::registry::DISCARD_ON_CANCEL_KEY,
             (),
         );
         // PORT: the clone takes the id kept for it when the warm started.
-        let next_snapshot_id = self.snapshot_id.replace(snapshot_id - 1);
-        let cloned_snapshot = new_snapshot.clone_(
+        let next_snapshot_id = self.snapshot_id.replace(warm.snapshot_id - 1);
+        let clone_start = Instant::now();
+        let cloned_snapshot = warm.new_snapshot.clone_(
             &build_ctx,
             warm_change,
-            &new_snapshot.overlays(),
+            &warm.new_snapshot.overlays(),
             Some(&self.logger),
             self.client.clone(),
         );
         self.snapshot_id.set(next_snapshot_id);
-
-        // If cancelled during clone, discard the incomplete result.
-        if warm_ctx.err().is_some() {
-            cloned_snapshot.deref();
-            new_snapshot.deref();
-            cancel();
-            return;
+        let end = self
+            .warm_auto_import_preempt
+            .end_attempt(&warm.ctx, &attempt_ctx);
+        attempt_cancel();
+        if end == WarmAttemptEnd::Done {
+            self.warm_auto_import_slow
+                .set(clone_start.elapsed() > WARM_AUTO_IMPORT_HOLD_CAP);
+        } else if hold.is_some() {
+            self.warm_auto_import_slow.set(true);
         }
 
-        // Conditionally adopt: if the session hasn't moved past newSnapshot,
-        // promote the clone so future requests benefit from the warmed cache.
-        self.adopt_snapshot_change(&new_snapshot, &cloned_snapshot);
-        new_snapshot.deref();
-        cancel();
+        match end {
+            WarmAttemptEnd::Yielded => {
+                cloned_snapshot.deref();
+                self.put_back_warm(PendingWarm {
+                    hold_from: None,
+                    retry: true,
+                    ..warm
+                });
+            }
+            // If cancelled during clone, discard the incomplete result.
+            WarmAttemptEnd::Cancelled => {
+                cloned_snapshot.deref();
+                warm.new_snapshot.deref();
+                (warm.cancel)();
+            }
+            WarmAttemptEnd::Done => {
+                // Conditionally adopt: if the session hasn't moved past newSnapshot,
+                // promote the clone so future requests benefit from the warmed cache.
+                self.adopt_snapshot_change(&warm.new_snapshot, &cloned_snapshot);
+                warm.new_snapshot.deref();
+                (warm.cancel)();
+            }
+        }
+    }
+
+    /// PORT: puts a warm whose attempt did not run or yielded back in the
+    /// pending slot (with its snapshot reference and its snapshot id), and
+    /// queues its next attempt.
+    fn put_back_warm(self: &Rc<Self>, warm: PendingWarm) {
+        // The slot is empty: only `warm_auto_import_cache` fills it, and it
+        // does not run during an attempt.
+        if let Some(previous) = self.warm_auto_import_pending.replace(Some(warm)) {
+            self.end_pending_warm(previous);
+        }
+        self.queue_pending_warm();
     }
 
     /// PORT: Go's deferred `newSnapshot.Deref(s)` and `cancel()` for a
@@ -3627,5 +3862,129 @@ impl Session {
     fn end_pending_warm(&self, warm: PendingWarm) {
         warm.new_snapshot.deref();
         (warm.cancel)();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOP: Option<Rc<dyn logging::Logger>> = None;
+
+    /// A preempt with a live warm, and the warm's context.
+    fn preempt_with_warm() -> (WarmAutoImportPreempt, Context) {
+        let preempt = WarmAutoImportPreempt::default();
+        let (ctx, cancel) = gostd::context::with_cancel(&gostd::context::background());
+        preempt.set(ctx.clone(), cancel, "/a.ts".to_string());
+        (preempt, ctx)
+    }
+
+    /// Runs `on_message` on another thread, and returns once the message is
+    /// queued. The thread gives its wait, from the queue call, and whether it
+    /// queued the message. The wait does not count the thread's start, so a
+    /// slow start under load does not shorten it.
+    fn message(
+        preempt: &WarmAutoImportPreempt,
+        file_event: bool,
+    ) -> std::thread::JoinHandle<(Duration, bool)> {
+        let preempt = preempt.clone();
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut start = None;
+            let queued = preempt.on_message(file_event, &NOP, || {
+                start = Some(Instant::now());
+                queued_tx.send(()).expect("test thread");
+                true
+            });
+            (start.expect("message queued").elapsed(), queued)
+        });
+        queued_rx.recv().expect("reader thread");
+        reader
+    }
+
+    // A message that comes during an eager attempt waits for the clone, at
+    // most for the hold. A clone that ends in time is neither cancelled nor
+    // yielded. The clone ends 20 ms after the message is queued, so the
+    // message waits at least that long, whatever the load.
+    #[test]
+    fn a_message_waits_for_an_eager_attempt_until_the_clone_ends() {
+        let (preempt, warm_ctx) = preempt_with_warm();
+        for file_event in [false, true] {
+            let (attempt_ctx, attempt_cancel) = gostd::context::with_cancel(&warm_ctx);
+            assert!(preempt.start_attempt(attempt_cancel, Some(Duration::from_secs(60))));
+            let reader = message(&preempt, file_event);
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(
+                preempt.end_attempt(&warm_ctx, &attempt_ctx),
+                WarmAttemptEnd::Done
+            );
+            let (waited, queued) = reader.join().expect("reader thread");
+            assert!(queued);
+            assert!(waited >= Duration::from_millis(20), "{waited:?}");
+            assert!(waited < Duration::from_secs(60), "{waited:?}");
+            assert!(attempt_ctx.err().is_none() && warm_ctx.err().is_none());
+        }
+    }
+
+    // After the hold, a message other than a file event yields the eager
+    // attempt, and a file event cancels the warm.
+    #[test]
+    fn after_the_hold_a_message_yields_the_attempt_and_a_file_event_cancels_the_warm() {
+        let hold = Duration::from_millis(20);
+        let (preempt, warm_ctx) = preempt_with_warm();
+        let (attempt_ctx, attempt_cancel) = gostd::context::with_cancel(&warm_ctx);
+        assert!(preempt.start_attempt(attempt_cancel, Some(hold)));
+        let (waited, queued) = message(&preempt, false).join().expect("reader thread");
+        assert!(queued && waited >= hold, "{waited:?}");
+        assert!(attempt_ctx.err().is_some() && warm_ctx.err().is_none());
+        assert_eq!(
+            preempt.end_attempt(&warm_ctx, &attempt_ctx),
+            WarmAttemptEnd::Yielded
+        );
+
+        let (attempt_ctx, attempt_cancel) = gostd::context::with_cancel(&warm_ctx);
+        assert!(preempt.start_attempt(attempt_cancel, Some(hold)));
+        let (waited, queued) = message(&preempt, true).join().expect("reader thread");
+        assert!(queued && waited >= hold, "{waited:?}");
+        assert!(warm_ctx.err().is_some());
+        assert_eq!(
+            preempt.end_attempt(&warm_ctx, &attempt_ctx),
+            WarmAttemptEnd::Cancelled
+        );
+    }
+
+    // During an attempt that is not eager, a message does not wait: a file
+    // event cancels the warm at once, and other messages leave it running.
+    #[test]
+    fn a_message_does_not_wait_for_an_attempt_that_is_not_eager() {
+        let (preempt, warm_ctx) = preempt_with_warm();
+        let (attempt_ctx, attempt_cancel) = gostd::context::with_cancel(&warm_ctx);
+        assert!(preempt.start_attempt(attempt_cancel, None));
+        let (_, queued) = message(&preempt, false).join().expect("reader thread");
+        assert!(queued && attempt_ctx.err().is_none() && warm_ctx.err().is_none());
+        let (_, queued) = message(&preempt, true).join().expect("reader thread");
+        assert!(queued && warm_ctx.err().is_some());
+        assert_eq!(
+            preempt.end_attempt(&warm_ctx, &attempt_ctx),
+            WarmAttemptEnd::Cancelled
+        );
+    }
+
+    // An attempt does not start while a message waits for the dispatch
+    // thread.
+    #[test]
+    fn an_attempt_does_not_start_while_a_message_waits() {
+        let (preempt, warm_ctx) = preempt_with_warm();
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        {
+            let busy = busy.clone();
+            preempt.set_busy(Box::new(move || {
+                busy.load(std::sync::atomic::Ordering::SeqCst)
+            }));
+        }
+        let (_, attempt_cancel) = gostd::context::with_cancel(&warm_ctx);
+        assert!(!preempt.start_attempt(attempt_cancel.clone(), Some(Duration::ZERO)));
+        busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(preempt.start_attempt(attempt_cancel, Some(Duration::ZERO)));
     }
 }

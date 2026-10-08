@@ -6,6 +6,15 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
+- **Public issues first (Theo, 2026-10-07).** Check `scripts/goport/gh-inbox.py list` every 2 hours. A real incompatibility that a user reports goes before perf work. Upstream issues get the `upstream issue` label and wait for a pin bump.
+- **int53 (after the R181 accept).** Lanes with a passed skeptic: memper1 46f9546f4, followups34 727abf2e5; infmemo1, propfilt1 and cfcache1 when their skeptics pass; PGO training C (`pgotrain2/build-release-C.diff`, both timing sides on the same training). Its checks step also runs `scripts/goport/macos-like-test.sh`.
+- **extrabat181 and followups35** (the R181 reviewer and auditor items), after the R181 accept.
+- **rr.py side order.** Interleave or shuffle the sides: on cup2 sys time grows with the run position after Go (int52 skeptic problem 2). The int53 prompt asks for interleaved sides; copy the fixed rr.py into `scripts/goport/` after int53.
+- **K2 node-redis check (compatsweep3).** Run `studies/compatsweep3/repros/redis-sig/run.sh` with the k2gaps1 head on a remote host after k2gaps1 ends.
+- **bwsig1 reviewer items (R181 item 2).** A test of the `.json` half (M5); drop the `watch_sources` entries of written paths when `build_all_tasks` ends. They are in `execute/build/*`, so they wait for k2gaps1.
+- **parsefast1 with the AST memory work (memast).** Waits for a design note.
+- **lschk1 redesign.** Parked.
+
 - **Default pin switch.** UPSTREAM.json current, ~/.local/bin/tsgo-oracle and the default Go checkout still point at dc37b5249; main is at 52168999f3dc and bump B moves it to 16c25522e123. Switch once, straight to the bump B pin, after bump B is accepted, in a quiet window, on zbook and every host (move the old default caches under pins/dc37b5249ab6 first). Owns: UPSTREAM.json, scripts/upstream/pin.py.
 
 - **Split the `ts_goport` crate: step 1 done (R131, accepted 2026-09-28).** Test runners now run 7 test binaries: ts_goport lib, goport_util lib, goport_lsproto lib, go_baselines, multi_program, emit_pool, early_emit (`test --release --no-run -p ts_goport --lib --test go_baselines --test multi_program --test emit_pool --test early_emit` and `test --release --no-run -p goport_util -p goport_lsproto --lib`). Goport-only revisions now carry the roster from R131 (roster fingerprint 0fd7856f). Steps 2 to 4 (`buildspeed/split-plan-r129.md`) wait for bump B wave 3 and lsshells M2/M3, and may change after the legacy removal plan (workflow legacy-removal-audit).

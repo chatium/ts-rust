@@ -1,15 +1,15 @@
 # @chatium/tsc-rs
 
 [tsc-rs](https://github.com/pingdotgg/ts-rust), a Rust port of the TypeScript 7 compiler (`tsc`),
-built from the fork [chatium/ts-rust](https://github.com/chatium/ts-rust) (branch `chatium`).
+built from the fork [chatium/ts-rust](https://github.com/chatium/ts-rust) (branch `chatium`): upstream
+`main` with only the packaging of this scope added, for the platforms below. It is published here
+when upstream `main` has changes that the `tsc-rs` npm release does not have yet.
 
-The fork adds one change to upstream: content-mapped files (`contentMappers`, for example `.vue`
-files through [`@chatium/vue-ts-mapper-rs`](https://www.npmjs.com/package/@chatium/vue-ts-mapper-rs))
-are transformed and parsed on the parse workers, with many mapper requests in flight, instead of
-one at a time on the loading thread
-([pingdotgg/ts-rust#18](https://github.com/pingdotgg/ts-rust/pull/18)). On Vue projects that makes
-the check 1.5 to 5 times faster than upstream tsc-rs; the output is the same.
-`GOPORT_MAPPED_PREFETCH=0` turns the change off.
+Upstream `main` transforms content-mapped files (`contentMappers`, for example `.vue` files through
+[`@chatium/vue-ts-mapper-rs`](https://www.npmjs.com/package/@chatium/vue-ts-mapper-rs)) on the parse
+workers, with many mapper requests in flight
+([pingdotgg/ts-rust#18](https://github.com/pingdotgg/ts-rust/pull/18)): on Vue projects the check is
+several times faster than with `tsc-rs` 0.1.0. `GOPORT_MAPPED_PREFETCH=0` turns that off.
 
 Report problems with this build at https://github.com/chatium/ts-rust/issues.
 

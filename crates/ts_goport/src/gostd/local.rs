@@ -24,9 +24,9 @@
 //!
 //! Idle work (`go_idle`) is a second, separate queue for long work that
 //! sends nothing to the client (the auto-import warm). The dispatch loop
-//! runs it with `run_idle()` only after a quiet period with no message, so
-//! it does not delay a request that has arrived. `run_pending` does not run
-//! it.
+//! runs it with `run_idle()` only when no message waits: at once or after a
+//! quiet period with no message, as the job asks (`IdleStart`), so it does
+//! not delay a request that has arrived. `run_pending` does not run it.
 //!
 //! Garbage (`drop_later`) is a third queue, for large frees that Go's
 //! garbage collector does in the background (a released program, the
@@ -152,7 +152,7 @@ struct LocalState {
     /// Timers that are armed or have a due entry in the queue.
     timers: RefCell<FxHashMap<u64, Rc<LocalTimerInner>>>,
     /// Jobs from `go_idle`, oldest first.
-    idle: RefCell<VecDeque<Box<dyn FnOnce()>>>,
+    idle: RefCell<VecDeque<(IdleStart, Box<dyn FnOnce()>)>>,
     /// Values from `drop_later`, oldest first. None until `keep_garbage`.
     garbage: RefCell<Option<VecDeque<Box<dyn Any>>>>,
     /// What `drop_after_pause` does (`note_message_gap`).
@@ -269,16 +269,28 @@ impl Drop for Post {
     }
 }
 
-/// Queues `f` as idle work on this thread. The dispatch loop runs it with
-/// `run_idle` when no message waits. No Go counterpart: Go runs this work
-/// on a goroutine, at the same time as requests.
-pub fn go_idle(f: Box<dyn FnOnce()>) {
-    LOCAL.with(|l| l.idle.borrow_mut().push_back(f));
+/// When the dispatch loop may start an idle job (`go_idle`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdleStart {
+    /// As soon as no message waits.
+    AtOnce,
+    /// After a quiet period with no message (the LSP server's
+    /// `IDLE_QUIET_PERIOD`).
+    AfterQuiet,
 }
 
-/// Whether idle work of this thread waits for `run_idle`.
-pub fn has_idle() -> bool {
-    LOCAL.with(|l| !l.idle.borrow().is_empty())
+/// Queues `f` as idle work on this thread. The dispatch loop runs it with
+/// `run_idle` when no message waits, at the time that `start` gives. No Go
+/// counterpart: Go runs this work on a goroutine, at the same time as
+/// requests.
+pub fn go_idle(start: IdleStart, f: Box<dyn FnOnce()>) {
+    LOCAL.with(|l| l.idle.borrow_mut().push_back((start, f)));
+}
+
+/// When the oldest idle job of this thread may start, or `None` when no
+/// idle work waits for `run_idle`.
+pub fn next_idle() -> Option<IdleStart> {
+    LOCAL.with(|l| l.idle.borrow().front().map(|(start, _)| *start))
 }
 
 /// Runs the oldest idle job of this thread. Returns false if there was none.
@@ -286,7 +298,7 @@ pub fn has_idle() -> bool {
 pub fn run_idle() -> bool {
     let job = LOCAL.with(|l| l.idle.borrow_mut().pop_front());
     match job {
-        Some(job) => {
+        Some((_, job)) => {
             job();
             true
         }
@@ -716,6 +728,37 @@ mod tests {
         })
         .join()
         .expect("timer test thread");
+    }
+
+    // `next_idle` gives the start of the oldest idle job, and `run_idle`
+    // runs the jobs in queue order.
+    #[test]
+    fn idle_jobs_run_in_order_and_give_their_start() {
+        std::thread::spawn(|| {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            assert_eq!(next_idle(), None);
+            for (start, name) in [
+                (IdleStart::AtOnce, "warm"),
+                (IdleStart::AfterQuiet, "retry"),
+            ] {
+                let log = log.clone();
+                go_idle(start, Box::new(move || log.borrow_mut().push(name)));
+            }
+            assert_eq!(next_idle(), Some(IdleStart::AtOnce));
+            run_pending();
+            assert!(
+                log.borrow().is_empty(),
+                "run_pending does not run idle work"
+            );
+            assert!(run_idle());
+            assert_eq!(next_idle(), Some(IdleStart::AfterQuiet));
+            assert!(run_idle());
+            assert_eq!(next_idle(), None);
+            assert!(!run_idle());
+            assert_eq!(*log.borrow(), ["warm", "retry"]);
+        })
+        .join()
+        .expect("idle test thread");
     }
 
     // Only the first release after a client pause waits for

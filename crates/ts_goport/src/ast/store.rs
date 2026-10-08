@@ -1516,9 +1516,11 @@ fn block_resolve_slot(b: &FileBlock, file: usize, index: usize) -> Node {
 
 /// The store and `GoFile` of a freeable file version (lsshells M3b), owned
 /// by its `FileVersion` (`ast::file_version`). The publish moves them here
-/// instead of leaking them; they are freed with the version. The block of
-/// its id is its node shell (`node_shell`), whose `BlockFile` has no store
-/// and no `GoFile`.
+/// instead of leaking them. They are freed when the version dies, or after
+/// it on a free thread when a pin release of the stdio API or the build
+/// takes them out of the dying version (`FileVersion::take_data`). The
+/// block of its id is its node shell (`node_shell`), whose `BlockFile` has
+/// no store and no `GoFile`.
 pub(crate) struct VersionStore {
     /// The store, without its node columns, which are in the node shell,
     /// and without the columns that only cache node data (`node_shell`). A
@@ -1542,7 +1544,8 @@ impl VersionStore {
 
 impl Drop for VersionStore {
     // The version is dead: `FileVersion::drop` put its id in the dead ids
-    // and took it out of the registry before its fields drop.
+    // and took it out of the registry before its fields drop, or before a
+    // free thread drops this store (`FileVersion::take_data`).
     fn drop(&mut self) {
         give_back_pool_block(std::mem::take(&mut self.block));
     }
@@ -1579,7 +1582,10 @@ impl PoolBlock {
 /// reuses the 40 bytes per node (a record and its kids, 24 + 16) of an
 /// older version of the file, where each shell leaked them before. The
 /// blocks never go back to the allocator.
-/// - A version gives its block back when it dies (`VersionStore`). The
+/// - A version's store gives its block back when it drops (`VersionStore`):
+///   when the version dies, or a little after on a free thread when a pin
+///   release or the build takes the store out of the dying version
+///   (`FileVersion::take_data`). The pin epoch is read at that drop. The
 ///   block waits in `quarantine` until `QUARANTINE_RELEASES` more pin
 ///   releases (`file_version::pin_epoch`) have happened, then goes to the
 ///   free list of its size class (`pool_class`). A pin release is a
@@ -2326,8 +2332,9 @@ pub fn owned_node_count() -> usize {
 
 /// The node datas, pending lists and parse lists of a freeable parse
 /// (lsshells M3c, `enter_freeable_parse`), owned by its store and so, after
-/// the publish, by its `FileVersion`: they are freed with the version. A
-/// static parse keeps them in the leaked AST arena (`AST_ARENA`).
+/// the publish, by its `FileVersion`: they are freed with its store, when
+/// the version dies or after it on a free thread (`VersionStore`). A static
+/// parse keeps them in the leaked AST arena (`AST_ARENA`).
 ///
 /// A node slot names its data by cell (`cell_of`). Its `FileStore::nodes`
 /// entry is the marker data (`owned_marker`), so the node column keeps its

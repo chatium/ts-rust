@@ -1264,6 +1264,144 @@ pub fn node_contains_position(node: Node, position: i32) -> bool {
         && (position < node.end() || position == node.end() && node.kind() == SyntaxKind::EndOfFile)
 }
 
+/// `get_node_at_position` for a series of positions in one tree that does
+/// not change between the calls. It gives the node that
+/// `get_node_at_position` gives for each position. It is fast when the
+/// positions never go down; a smaller position descends from the root.
+// PERF: loadcrit1 step 0. `for_each_dynamic_import_or_require_call` looks up
+// each `import`/`require` word. Go descends from the root for each word and
+// checks the children of each level in order (ast/utilities.go:2705). A
+// `.d.ts` file with a wide type literal (@redis/client
+// `commands/index.d.ts`: 743 members, 10,783 words) makes that
+// O(words x members). In the port each check also reads a store record that
+// the parse has not published yet (`loc_slow`, `kind_slow`), so this one
+// parse held the umami and directus loads for about 80 ms.
+//
+// The cursor also descends from the root for each position, and gives the
+// same first child at each level as Go's scan. It keeps the levels of the
+// last descent: each node with its children in `for_each_child` order and
+// `skip`, the count of leading children that contain no position from the
+// last one on. A later position only grows, so the scan of a level starts
+// at `skip`, and the children it passes cannot contain the position. This
+// holds for any tree shape (overlapping or unsorted children, JSDoc), so
+// the JS files use the cursor too.
+#[derive(Default)]
+struct NodeAtPositionCursor {
+    /// The levels of the last descent, root first. A level past the
+    /// current depth is the state of a node that the descent left; it is
+    /// used again only for the same node.
+    levels: Vec<CursorLevel>,
+    last_position: i32,
+}
+
+struct CursorLevel {
+    node: Node,
+    children: Vec<Node>,
+    /// No child before this index contains a position from
+    /// `NodeAtPositionCursor::last_position` on.
+    skip: usize,
+}
+
+impl CursorLevel {
+    fn new(node: Node) -> CursorLevel {
+        let mut level = CursorLevel {
+            node,
+            children: Vec::new(),
+            skip: 0,
+        };
+        level.collect_children();
+        level
+    }
+
+    fn reset(&mut self, node: Node) {
+        self.node = node;
+        self.children.clear();
+        self.skip = 0;
+        self.collect_children();
+    }
+
+    fn collect_children(&mut self) {
+        let children = &mut self.children;
+        self.node.for_each_child(|child| {
+            children.push(child);
+            false
+        });
+    }
+
+    /// The first child that contains `position` (Go's `ForEachChild` scan
+    /// in `GetNodeAtPosition`), or nil. Moves `skip` over the leading
+    /// children that contain no position from `position` on.
+    fn first_child_containing(&mut self, position: i32) -> Node {
+        let mut passed_only_dead = true;
+        for index in self.skip..self.children.len() {
+            let child = self.children[index];
+            let kind = child.kind();
+            let dead = if (kind as u16) < (SyntaxKind::FIRST_NODE as u16) {
+                true
+            } else {
+                let loc = child.loc();
+                // Go: ast/utilities.go:2733 nodeContainsPosition
+                if loc.pos() <= position
+                    && (position < loc.end()
+                        || position == loc.end() && kind == SyntaxKind::EndOfFile)
+                {
+                    return child;
+                }
+                // No later position is in it: the range left from
+                // `max(pos, position)` on is empty.
+                let from = loc.pos().max(position);
+                loc.end() < from || loc.end() == from && kind != SyntaxKind::EndOfFile
+            };
+            passed_only_dead &= dead;
+            if passed_only_dead {
+                self.skip = index + 1;
+            }
+        }
+        Node::NIL
+    }
+}
+
+impl NodeAtPositionCursor {
+    // Go: ast/utilities.go:2705 GetNodeAtPosition
+    fn node_at(&mut self, file: Node, position: i32, include_js_doc: bool) -> Node {
+        if position < self.last_position {
+            // The skips may pass the node of a smaller position. Go has no
+            // cursor and descends from the root for each position, so do
+            // that. The levels stay valid for `last_position` on.
+            return get_node_at_position(file, position, include_js_doc);
+        }
+        self.last_position = position;
+        if self.levels.is_empty() {
+            self.levels.push(CursorLevel::new(file));
+        }
+        let mut depth = 0;
+        loop {
+            let current = self.levels[depth].node;
+            let mut child = Node::NIL;
+            if include_js_doc {
+                for jsdoc in current.js_doc(file).to_vec() {
+                    if node_contains_position(jsdoc, position) {
+                        child = jsdoc;
+                        break;
+                    }
+                }
+            }
+            if child.is_nil() {
+                child = self.levels[depth].first_child_containing(position);
+            }
+            if child.is_nil() || is_meta_property(child) {
+                return current;
+            }
+            depth += 1;
+            match self.levels.get_mut(depth) {
+                None => self.levels.push(CursorLevel::new(child)),
+                Some(level) if level.node != child => level.reset(child),
+                Some(_) => {}
+            }
+        }
+    }
+}
+
 // Go: ast/utilities.go:2737 findImportOrRequire
 pub fn find_import_or_require(text: &str, start: i32) -> (i32, i32) {
     let bytes = text.as_bytes();
@@ -1303,12 +1441,18 @@ pub fn for_each_dynamic_import_or_require_call(
 ) -> bool {
     let is_java_script_file = is_in_js_file(file);
     let text = source_file_text(file);
+    let include_js_doc = is_java_script_file && include_type_space_imports;
+    // PERF: loadcrit1 step 0. Go calls `GetNodeAtPosition` from the root for
+    // each word. The cursor gives the same node for each word (see
+    // `NodeAtPositionCursor`).
+    let mut cursor = NodeAtPositionCursor::default();
     let (mut last_index, mut size) = find_import_or_require(&text, 0);
     while last_index >= 0 {
-        let node = get_node_at_position(
-            file,
-            last_index,
-            is_java_script_file && include_type_space_imports,
+        let node = cursor.node_at(file, last_index, include_js_doc);
+        debug_assert_eq!(
+            node,
+            get_node_at_position(file, last_index, include_js_doc),
+            "cursor node at {last_index}"
         );
         if is_java_script_file && is_require_call(node, require_string_literal_like_argument) {
             if cb(node, node.arguments().get(0)) {
@@ -1332,4 +1476,133 @@ pub fn for_each_dynamic_import_or_require_call(
         (last_index, size) = find_import_or_require(&text, last_index);
     }
     false
+}
+
+#[cfg(test)]
+mod node_at_position_cursor_tests {
+    use super::*;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::frontend::tspath::Path;
+
+    fn parse(name: &str, text: &'static str, kind: ScriptKind) -> Node {
+        parse_source_file(
+            &SourceFileParseOptions {
+                file_name: name.to_string(),
+                path: Path(name.to_string()),
+                ..Default::default()
+            },
+            text,
+            kind,
+        )
+        .root
+    }
+
+    /// The cursor gives the node of `get_node_at_position` at every
+    /// position in order, and at every `import`/`require` word (the
+    /// positions of `for_each_dynamic_import_or_require_call`, also in
+    /// comments, strings and names), with and without JSDoc.
+    fn check(file: Node) {
+        let text = source_file_text(file);
+        let mut words = Vec::new();
+        let (mut index, mut size) = find_import_or_require(&text, 0);
+        while index >= 0 {
+            words.push(index);
+            (index, size) = find_import_or_require(&text, index + size);
+        }
+        assert!(!words.is_empty());
+        let every = (0..=text.len() as i32).collect::<Vec<_>>();
+        for include_js_doc in [false, true] {
+            for positions in [&every, &words] {
+                let mut cursor = NodeAtPositionCursor::default();
+                for &position in positions {
+                    assert_eq!(
+                        cursor.node_at(file, position, include_js_doc),
+                        get_node_at_position(file, position, include_js_doc),
+                        "position {position}, JSDoc {include_js_doc}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cursor_finds_the_node_of_a_root_descent() {
+        // A wide type literal, as @redis/client `commands/index.d.ts`.
+        let mut wide = String::from("// import require\ndeclare const _default: {\n");
+        for i in 0..300 {
+            wide += &format!(
+                "    /** import {i} */ m{i}: typeof import(\"./m{i}\"); importantRequire{i}: import(\"./t{i}\").T<\"require\">;\n"
+            );
+        }
+        wide += "    // import before the brace\n};\nexport default _default; // require\n";
+        check(parse("/wide.d.ts", wide.leak(), ScriptKind::TS));
+
+        check(parse(
+            "/a.ts",
+            "import x from \"x\";\nexport * from \"./require\";\n\
+             const m = import.meta; const n = import.meta.url;\n\
+             async function f() { await import(\"a\"); return import(`b`).then(() => import(c)); }\n\
+             type T = typeof import(\"t\") extends import(\"u\").U ? 1 : 2;\n\
+             class C { @dec(import(\"d\")) static [require(\"k\")]: import(\"v\").V; }\n\
+             declare module \"require\" { export type R = import(\"r\").R; }\n\
+             // import(\"in a comment\") require(\"x\")\n\
+             const s = \"import('a string') require\"; /* import */",
+            ScriptKind::TS,
+        ));
+
+        check(parse(
+            "/a.js",
+            "const a = require(\"a\");\n\
+             /** @type {import(\"b\").B} */\n\
+             const b = require(`b`).b;\n\
+             /**\n * @typedef {import('c').C} C\n * @param {import(\"d\").D} d\n * @returns {Promise<import(\"e\")>}\n */\n\
+             function f(d) { return import(\"e\"); }\n\
+             module.exports = { requireIt: () => require(\"f\") };\n\
+             /** @import { G } from \"g\" */\n",
+            ScriptKind::JS,
+        ));
+
+        // Error recovery: missing and zero-width nodes, unclosed lists.
+        check(parse(
+            "/broken.ts",
+            "const a = import(; type T = import(\nclass { import( }\n\
+             function require(x, { import\nlet [b, require(\"c\")] = import(\"d\"\n\
+             export default async function* ( require ) => import\n\
+             <div>{import(\"e\")} require</div>\n\
+             type U = { [K in import(\"f\")]: require",
+            ScriptKind::TS,
+        ));
+
+        check(parse(
+            "/a.tsx",
+            "const x = <A b={import(\"b\")}>import require {require(\"c\")}</A>;\n\
+             export const y = () => <></>; import(\"z\");",
+            ScriptKind::TSX,
+        ));
+    }
+
+    /// After the cursor has passed a position, a smaller one still gets the
+    /// node of a root descent (loadcrit1 follow-up: Go has no cursor). The
+    /// positions go up, down and up again, so a fallback that moves
+    /// `last_position` down fails (the followups33 skeptic's mutant CURS).
+    #[test]
+    fn a_smaller_position_gets_the_node_of_a_root_descent() {
+        let mut wide = String::from("declare const _default: {\n");
+        for i in 0..20 {
+            wide += &format!("    m{i}: typeof import(\"./m{i}\");\n");
+        }
+        wide += "};\nexport default _default;\n";
+        let file = parse("/wide.d.ts", wide.leak(), ScriptKind::TS);
+        let end = source_file_text(file).len() as i32;
+        for include_js_doc in [false, true] {
+            let mut cursor = NodeAtPositionCursor::default();
+            for position in (0..=end).chain((0..=end).rev()).chain(0..=end) {
+                assert_eq!(
+                    cursor.node_at(file, position, include_js_doc),
+                    get_node_at_position(file, position, include_js_doc),
+                    "position {position}, JSDoc {include_js_doc}"
+                );
+            }
+        }
+    }
 }

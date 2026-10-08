@@ -710,10 +710,46 @@ pub fn new_external_diagnostic(
 /// is stored (an API checker reads a symbol of a version that another
 /// snapshot holds, and that snapshot is released), and a read of its name
 /// then panics. So `add` keeps the name of each file that the stored
-/// diagnostic and its related information point at (`file_names`), and
-/// the compares of stored diagnostics read the name there
-/// (`stored_diagnostic_path`). A related information that a caller adds
-/// to the stored diagnostic after `add` has its name read from its file.
+/// diagnostic and its related information point at (`stored_file_names`),
+/// and the compares of stored diagnostics read the name there
+/// (`stored_diagnostic_path`).
+/// Related information that a caller adds to a stored diagnostic after
+/// `add` is not in `stored_file_names`, so a compare reads its name from
+/// its file. Only four callers can put it in another file:
+/// `add_duplicate_declaration_error` (the other declarations), the
+/// assertion call (the declarations of `get_type_of_dotted_name`), the
+/// circular constraint (the node that the checker is at) and
+/// `invocation_error_recovery` (the import, for `invocation_error` and the
+/// decorator call). `error_and_maybe_suggest_await` puts it in the
+/// diagnostic's own file, the regular expression errors give it no file,
+/// and `add_related_info_to_reported_diagnostic` runs only in deferred
+/// diagnostics. No path reads such a name after its file dies
+/// (followups31):
+/// - Go `Add` (ast/diagnostic.go:269) compares a new diagnostic of any
+///   caller with each stored one of the same path, location and code.
+///   `EqualDiagnostics` reads the related information only when all else
+///   is equal, the message chain too, and the two lists have the same
+///   length (`slices.EqualFunc`). The new diagnostic has only the related
+///   information that its caller added before `add`, and with an equal
+///   message and chain, that is the part that the stored diagnostic had at
+///   its own `add`: no caller gives the duplicate declaration codes, the
+///   assertion code or the circular constraint code related information
+///   before `add`, and an invocation error gets the semicolon note of its
+///   node and the await note of its apparent type, whose text is in the
+///   chain. So when the stored diagnostic has later information, the
+///   lengths are not equal, and `add` reads none of it.
+/// - `lookup` and the sorts compare stored diagnostics, and two of them
+///   can differ only in their later information (a second duplicate
+///   declaration error at a node does not equal the first one when the
+///   first one has information). They run only in a check of a file
+///   (`check_source_file`), in `get_diagnostics` and in
+///   `get_global_diagnostics`, on a checker whose program holds every file
+///   of its diagnostics.
+/// - The API's persistent checker, the only one that gets symbols of other
+///   file versions (`api::checker_symbol`), runs no `lookup` and no sort.
+///
+/// A change to any of these must also keep the names of the later
+/// related information.
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsCollection {
     pub count: i32,
@@ -727,8 +763,9 @@ pub struct DiagnosticsCollection {
     diagnostic_collisions: FxHashMap<DiagnosticLocationKey, Vec<usize>>,
     // diagfix1: the file name of each source file node that a stored
     // diagnostic or its related information points at. Empty in a process
-    // that frees no file version (`any_freeable_published`).
-    file_names: FxHashMap<Node, &'static str>,
+    // that frees no file version (`any_freeable_published`). Not the
+    // `file_names` method, which gives the keys of `file_diagnostics`.
+    stored_file_names: FxHashMap<Node, &'static str>,
 }
 
 impl DiagnosticsCollection {
@@ -762,7 +799,7 @@ impl DiagnosticsCollection {
             self.non_file_diagnostics_sorted = false;
         }
         if super::file_version::any_freeable_published() {
-            note_file_names(&mut self.file_names, &diagnostic);
+            note_file_names(&mut self.stored_file_names, &diagnostic);
         }
         self.diagnostics.push(diagnostic);
         &mut self.diagnostics[id]
@@ -772,7 +809,7 @@ impl DiagnosticsCollection {
     // PORT: split out so `add` can return the stored entry after the search
     // borrows end.
     fn find_equal(&self, key: DiagnosticLocationKey, diagnostic: &Diagnostic) -> Option<usize> {
-        let path = |d: &Diagnostic| stored_diagnostic_path(&self.file_names, d);
+        let path = |d: &Diagnostic| stored_diagnostic_path(&self.stored_file_names, d);
         let existing = *self.diagnostic_index.get(&key)?;
         if equal_diagnostics_by(&self.diagnostics[existing], diagnostic, &path) {
             return Some(existing);
@@ -793,13 +830,13 @@ impl DiagnosticsCollection {
     pub fn lookup(&mut self, diagnostic: &Diagnostic) -> Option<&mut Diagnostic> {
         let diagnostics = if diagnostic.file().is_some() {
             self.get_diagnostics_for_file_locked(stored_diagnostic_path(
-                &self.file_names,
+                &self.stored_file_names,
                 diagnostic,
             ))
         } else {
             self.get_global_diagnostics_locked()
         };
-        let path = |d: &Diagnostic| stored_diagnostic_path(&self.file_names, d);
+        let path = |d: &Diagnostic| stored_diagnostic_path(&self.stored_file_names, d);
         // Go slices.BinarySearchFunc: the first index where cmp >= 0.
         let i = diagnostics.partition_point(|&d| {
             compare_diagnostics_by(&self.diagnostics[d], diagnostic, &path) < 0
@@ -826,7 +863,7 @@ impl DiagnosticsCollection {
             sort_diagnostic_ids(
                 &mut self.non_file_diagnostics,
                 &self.diagnostics,
-                &self.file_names,
+                &self.stored_file_names,
             );
             self.non_file_diagnostics_sorted = true;
         }
@@ -859,7 +896,7 @@ impl DiagnosticsCollection {
         if !self.file_diagnostics_sorted.contains(path) {
             if let Some(ids) = self.file_diagnostics.get_mut(path) {
                 // Go: ast/diagnostic.go:347 slices.SortStableFunc(c.fileDiagnostics[path], CompareDiagnostics)
-                sort_diagnostic_ids(ids, &self.diagnostics, &self.file_names);
+                sort_diagnostic_ids(ids, &self.diagnostics, &self.stored_file_names);
             }
             self.file_diagnostics_sorted.insert(path);
         }
@@ -876,7 +913,7 @@ impl DiagnosticsCollection {
             diagnostics.extend(ids.iter().map(|&id| self.diagnostics[id].clone()));
         }
         // Go: ast/diagnostic.go:362 slices.SortFunc(diagnostics, CompareDiagnostics)
-        let path = |d: &Diagnostic| stored_diagnostic_path(&self.file_names, d);
+        let path = |d: &Diagnostic| stored_diagnostic_path(&self.stored_file_names, d);
         crate::gostd::slices::sort_func(&mut diagnostics, |a, b| {
             compare_diagnostics_by(a, b, &path)
         });
@@ -885,14 +922,14 @@ impl DiagnosticsCollection {
 }
 
 // Go `slices.SortStableFunc(list, CompareDiagnostics)` on a list of
-// positions in `diagnostics`, with the paths of `file_names`
+// positions in `diagnostics`, with the paths of `stored_file_names`
 // (`stored_diagnostic_path`).
 fn sort_diagnostic_ids(
     ids: &mut [usize],
     diagnostics: &[Diagnostic],
-    file_names: &FxHashMap<Node, &'static str>,
+    stored_file_names: &FxHashMap<Node, &'static str>,
 ) {
-    let path = |d: &Diagnostic| stored_diagnostic_path(file_names, d);
+    let path = |d: &Diagnostic| stored_diagnostic_path(stored_file_names, d);
     crate::gostd::slices::sort_stable_func(ids, |&a, &b| {
         compare_diagnostics_by(&diagnostics[a], &diagnostics[b], &path)
     });
@@ -900,18 +937,18 @@ fn sort_diagnostic_ids(
 
 /// diagfix1: adds the file names of `diagnostic` and of its related
 /// information (the files whose names `equal_diagnostics` and
-/// `compare_diagnostics` read) to `file_names`. Called when `diagnostic` is
-/// stored, while its files are alive. A factory-made source file is left
-/// out: its name is read from it, as before.
-fn note_file_names(file_names: &mut FxHashMap<Node, &'static str>, diagnostic: &Diagnostic) {
+/// `compare_diagnostics` read) to `stored_file_names`. Called when
+/// `diagnostic` is stored, while its files are alive. A factory-made
+/// source file is left out: its name is read from it, as before.
+fn note_file_names(stored_file_names: &mut FxHashMap<Node, &'static str>, diagnostic: &Diagnostic) {
     let file = diagnostic.file();
     if file.is_some() && !super::is_synthetic_node(file) {
-        file_names
+        stored_file_names
             .entry(file)
             .or_insert_with(|| source_file_file_name(file));
     }
     for related in diagnostic.related_information() {
-        note_file_names(file_names, related);
+        note_file_names(stored_file_names, related);
     }
 }
 
@@ -920,11 +957,11 @@ fn note_file_names(file_names: &mut FxHashMap<Node, &'static str>, diagnostic: &
 /// not read a file version that died after `add`. Else the name of the
 /// file.
 fn stored_diagnostic_path(
-    file_names: &FxHashMap<Node, &'static str>,
+    stored_file_names: &FxHashMap<Node, &'static str>,
     d: &Diagnostic,
 ) -> &'static str {
-    if !file_names.is_empty()
-        && let Some(&name) = file_names.get(&d.file())
+    if !stored_file_names.is_empty()
+        && let Some(&name) = stored_file_names.get(&d.file())
     {
         return name;
     }
@@ -956,7 +993,8 @@ fn get_diagnostic_location_key(diagnostic: &Diagnostic) -> DiagnosticLocationKey
 
 // Go: ast/diagnostic.go:390 getDiagnosticPath
 // PORT: returns `&'static str` (file names live for the program).
-fn get_diagnostic_path(d: &Diagnostic) -> &'static str {
+#[must_use]
+pub fn get_diagnostic_path(d: &Diagnostic) -> &'static str {
     if d.file().is_some() {
         return source_file_file_name(d.file());
     }
@@ -1004,8 +1042,15 @@ fn equal_diagnostics_no_related_info_by<P: Fn(&Diagnostic) -> &'static str>(
     if std::ptr::eq(d1, d2) {
         return true;
     }
-    path(d1) == path(d2)
-        && d1.pos() == d2.pos()
+    path(d1) == path(d2) && equal_diagnostics_no_related_info_after_path(d1, d2)
+}
+
+/// `equal_diagnostics_no_related_info` of two diagnostics whose paths
+/// (`get_diagnostic_path`) are equal: the checks after the path.
+/// `program::sort_and_deduplicate_diagnostics` reads each file name once.
+#[must_use]
+pub fn equal_diagnostics_no_related_info_after_path(d1: &Diagnostic, d2: &Diagnostic) -> bool {
+    d1.pos() == d2.pos()
         && d1.end() == d2.end()
         && d1.code() == d2.code()
         // tsgo#4712
@@ -1136,15 +1181,32 @@ fn compare_diagnostics_by<P: Fn(&Diagnostic) -> &'static str>(
     }
     // PORT: Go compares the bytes of the strings, which are port forms here
     // (see `scanner_util::compare_go_bytes`).
-    let mut c = ordering_to_int(compare_go_bytes(path(d1), path(d2)));
+    let c = ordering_to_int(compare_go_bytes(path(d1), path(d2)));
     if c != 0 {
         return c;
     }
+    compare_diagnostics_after_path_by(d1, d2, path)
+}
+
+/// `compare_diagnostics` of two diagnostics whose paths
+/// (`get_diagnostic_path`) compare equal: the compares after the path.
+/// `program::sort_and_deduplicate_diagnostics` ranks each file name once.
+#[must_use]
+pub fn compare_diagnostics_after_path(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
+    compare_diagnostics_after_path_by(d1, d2, &get_diagnostic_path)
+}
+
+/// `compare_diagnostics_by` after the path compare.
+fn compare_diagnostics_after_path_by<P: Fn(&Diagnostic) -> &'static str>(
+    d1: &Diagnostic,
+    d2: &Diagnostic,
+    path: &P,
+) -> i32 {
     // PORT: Go subtracts these int32 values as Go ints (64 bits), so the
     // sign is their true order. An `i32` difference can wrap on the values
     // of a bad `.tsbuildinfo` (category -2147483648 and 1), so the port
     // compares them.
-    c = ordering_to_int(d1.pos().cmp(&d2.pos()));
+    let mut c = ordering_to_int(d1.pos().cmp(&d2.pos()));
     if c != 0 {
         return c;
     }

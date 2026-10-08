@@ -1049,7 +1049,7 @@ impl Checker {
                 create_diagnostic_chain_from_error_chain(
                     rb.error_chain.as_deref(),
                     rb.error_node,
-                    &rb.related_info,
+                    rb.related_info.as_slice(),
                 )
             };
             // PORT: Go `reportDiagnostic` ignores a nil diagnostic.

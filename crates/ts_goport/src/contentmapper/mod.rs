@@ -1,11 +1,11 @@
 //! Go package `internal/contentmapper` (tsgo#4712).
 //!
-//! PORT: the host is dispatch-thread state, like the ipc connection it
-//! drives (`ipc::AsyncConn` is `Rc`-based) and the frontend values it takes
-//! (`Rc<CompilerOptions>`, `Rc<Mapper>`). Go's mutexes and atomics on host
-//! state are `Cell` and `RefCell` (PORTING.md "Go runtime"). Only the
-//! spawned process connections (`ipc::ReadWriteCloser`) and the stderr
-//! logger cross threads.
+//! PORT: the host is dispatch-thread state, as the frontend values it takes
+//! (`Rc<CompilerOptions>`, `Rc<Mapper>`). Go's mutexes on host state are
+//! `Cell` and `RefCell` (PORTING.md "Go runtime"). The spawned process
+//! connections (`muxconn::MuxConn`), the timing collector and the stderr
+//! logger cross threads: the parse workers send transform requests too
+//! (`hostimpl::ConcurrentTransform`), as Go's parse goroutines do.
 
 pub mod contentmapper;
 pub mod host;

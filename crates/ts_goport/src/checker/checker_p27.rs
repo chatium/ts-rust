@@ -221,6 +221,7 @@ impl Checker {
                 outer_type_parameters: outer_type_parameters.clone(),
                 instantiations: None,
                 alias,
+                distribution_dependent: None,
             }));
             let resolved = self.get_conditional_type(
                 root.clone(),

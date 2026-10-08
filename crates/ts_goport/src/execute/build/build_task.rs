@@ -4,7 +4,8 @@ use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::{BuildCompilerHost, BuildHost, WrittenPaths};
 use crate::execute::build::up_to_date_status::*;
 use crate::execute::incremental::build_info::{
-    BuildInfoRootInfoReader, content_mapper_identities, is_build_info_file_name_default_library,
+    BuildInfoRootInfoReader, build_info_version, content_mapper_identities,
+    is_build_info_file_name_default_library,
 };
 use crate::execute::incremental::emit_files::{buffer_early_emit_writes, fs_error_text};
 use crate::execute::incremental::incremental::Host as IncrementalHost;
@@ -130,6 +131,8 @@ pub struct StatusCheckOptions {
     emit_declarations: bool,
     no_check: bool,
     no_emit: bool,
+    /// The Effect rules run (`BuildInfo::is_valid_version`).
+    effect: bool,
 }
 
 impl StatusCheckOptions {
@@ -139,6 +142,7 @@ impl StatusCheckOptions {
             emit_declarations: options.get_emit_declarations(),
             no_check: options.no_check.is_true(),
             no_emit: options.no_emit.is_true(),
+            effect: crate::effect::rulerunner::enabled_options(options).is_some(),
         }
     }
 
@@ -147,7 +151,7 @@ impl StatusCheckOptions {
     /// that read only the build info and these options. True otherwise,
     /// also when the check may return early for another reason.
     pub fn reads_input_times(self, build_info: &BuildInfo) -> bool {
-        if !build_info.is_valid_version() {
+        if !build_info.is_valid_version(self.effect) {
             return false;
         }
         if build_info.errors
@@ -802,7 +806,8 @@ impl BuildTask {
     /// sends values that `signal` makes behind the check and emit jobs that
     /// the task's program started (`program::send_checker_barrier`), and
     /// returns how many there are. When all have dropped, those jobs are
-    /// done. 0 when the program has no checker pool, so no job runs.
+    /// done. 0 when the program has no checker pool, so no job runs (no
+    /// check and no early emit started).
     pub fn notify_when_compiled<T: Send + 'static>(&self, signal: impl Fn() -> T) -> usize {
         let compile = self.compile.as_ref().expect("compile_and_emit_start ran");
         let _scope = crate::core::enter_program(Some(compile.program));
@@ -1053,11 +1058,15 @@ impl BuildTask {
             // check starts on this program's checker threads now, and so
             // does the emit, behind the check, as in `tsc -p` (when the
             // rules of `Program::start_emit` allow it; else the emit runs
-            // in `compile_and_emit_finish`). The emit keeps its writes
+            // in `compile_and_emit_finish`). A task that checks nothing
+            // (cached semantic diagnostics, `noCheck`, or syntactic, program
+            // or global diagnostics) starts its emit there too, so it ends
+            // when its emit ends, as its Go goroutine does. The emit keeps
+            // its writes
             // until `compile_and_emit_finish`, which writes them first
             // (`buffer_early_emit_writes`). So the task writes when the
-            // orchestrator finishes it (in the order the checks end, or in
-            // build order when tasks share outputs, see
+            // orchestrator finishes it (in the order the checks and emits
+            // end, or in build order when tasks share outputs, see
             // `build_all_tasks`), and a task that runs beside others reads
             // the file system before they write. The statistics' check time
             // is the time of the wait for the check plus the time that
@@ -1381,7 +1390,9 @@ impl BuildTask {
         };
 
         // build info version
-        if !build_info.is_valid_version() {
+        if !build_info.is_valid_version(
+            crate::effect::rulerunner::enabled_options(resolved.compiler_options()).is_some(),
+        ) {
             return UpToDateStatus::with_data(
                 UpToDateStatusType::TsVersionOutputOfDate,
                 UpToDateStatusData::String(build_info.version.clone()),
@@ -1954,7 +1965,13 @@ impl BuildTask {
             }
             UpToDateStatusType::TsVersionOutputOfDate => new_compiler_diagnostic(
                 diag::Project_0_is_out_of_date_because_output_for_it_was_generated_with_version_1_that_differs_with_current_version_2,
-                args![config, o.relative_file_name(status.data_string()), version()],
+                args![
+                    config,
+                    o.relative_file_name(status.data_string()),
+                    build_info_version(self.resolved.as_ref().is_some_and(|r| {
+                        crate::effect::rulerunner::enabled_options(r.compiler_options()).is_some()
+                    }))
+                ],
             ),
             UpToDateStatusType::ForceBuild => new_compiler_diagnostic(
                 diag::Project_0_is_being_forcibly_rebuilt,

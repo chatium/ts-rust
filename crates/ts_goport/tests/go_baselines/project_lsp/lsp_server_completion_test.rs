@@ -406,3 +406,217 @@ child_test! {
         );
     }
 }
+
+/// A didChange of `u` to `text`, the whole document.
+fn change(client: &LspClient, u: &lsproto::DocumentUri, version: i32, text: &str) {
+    client.send_notification(
+        &lsproto::TEXT_DOCUMENT_DID_CHANGE_INFO,
+        lsproto::DidChangeTextDocumentParams {
+            text_document: lsproto::VersionedTextDocumentIdentifier {
+                uri: u.clone(),
+                version,
+            },
+            content_changes: vec![lsproto::TextDocumentContentChangePartialOrWholeDocument {
+                partial: None,
+                whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                    text: text.to_string(),
+                }),
+            }],
+        },
+    );
+}
+
+child_test! {
+    // PORT: no Go counterpart (lswarm1, lspsweep2 g3-warm-race). The
+    // diagnostic pull flushes the change that imports ./ext/other, and that
+    // snapshot change starts the auto-import warm (Go warmAutoImportCache,
+    // session.go:2046), which indexes other.ts while the program has it. Go
+    // starts the warm on a goroutine before the diagnostic's answer. The
+    // next change removes the import 40 ms after the answer; Go's
+    // registry keeps the exports of a file that left the program
+    // (registry.go:1033-1040, :1137), so the last completion offers
+    // `widget`. The port started the warm only after 50 ms with no message,
+    // so the change cancelled it and the completion did not offer `widget`.
+    // The gap stays under `IDLE_QUIET_PERIOD` (50 ms), so the old rule
+    // still fails, and gives the small clone room under load.
+    fn auto_import_warm_runs_before_the_next_change() {
+        let client = init_completion_client(
+            "/home/projects",
+            &[
+                (
+                    "/home/projects/tsconfig.json",
+                    r#"{"compilerOptions": {"strict": true, "target": "es2020", "module": "esnext", "moduleResolution": "bundler"}, "files": ["a.ts"]}"#,
+                ),
+                ("/home/projects/a.ts", "export function main() {\n  return 1;\n}\nwid\n"),
+                (
+                    "/home/projects/ext/other.ts",
+                    "export const other = 1;\nexport function widget(): number { return 2; }\n",
+                ),
+            ],
+        );
+        let a_uri = lsconv::file_name_to_document_uri("/home/projects/a.ts");
+        let text = "export function main() {\n  return 1;\n}\nwid\n";
+        open(&client, &a_uri, text);
+        let (msg, _) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_COMPLETION_INFO,
+            completion_params(&a_uri, 3, 3),
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+
+        change(&client, &a_uri, 2, &format!("import {{ other }} from './ext/other';\n{text}"));
+        let (msg, _) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_DIAGNOSTIC_INFO,
+            lsproto::DocumentDiagnosticParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: a_uri.clone() },
+                ..Default::default()
+            },
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        change(&client, &a_uri, 3, text);
+
+        let (msg, resp) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_COMPLETION_INFO,
+            completion_params(&a_uri, 3, 3),
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        let items = completion_items(resp);
+        let widget = find_completion_item(&items, "widget").expect("widget in the completions");
+        let auto_import = widget
+            .data
+            .as_ref()
+            .and_then(|data| data.auto_import.as_ref())
+            .expect("item.Data.AutoImport");
+        assert_eq!(auto_import.module_specifier, "./ext/other");
+    }
+}
+
+/// A project for the module augmentation tests (aispec1, knownprob1 S3), as
+/// in Hono, where each middleware augments `ContextVariableMap`: each
+/// `src/mw/<name>/index.ts` re-exports `exports` from `./<name>` and augments
+/// `'../..'`, which is `src/index.ts`. Opens `src/main.ts`.
+fn augmentation_client(middleware: &[(&str, &[&str])]) -> (LspClient, lsproto::DocumentUri) {
+    let mut entries = vec![
+        (
+            "/home/projects/tsconfig.json".to_string(),
+            r#"{"compilerOptions": {"module": "esnext", "moduleResolution": "bundler", "target": "esnext", "strict": true}}"#.to_string(),
+        ),
+        ("/home/projects/src/index.ts".to_string(), "export type { Vars } from './context'\n".to_string()),
+        ("/home/projects/src/context.ts".to_string(), "export interface Vars {}\n".to_string()),
+        ("/home/projects/src/main.ts".to_string(), "export const x = 1\n".to_string()),
+    ];
+    for (name, exports) in middleware {
+        entries.push((
+            format!("/home/projects/src/mw/{name}/index.ts"),
+            format!(
+                "export {{ {} }} from './{name}'\n\ndeclare module '../..' {{\n  interface Vars {{\n    {name}: string\n  }}\n}}\n",
+                exports.join(", ")
+            ),
+        ));
+        entries.push((
+            format!("/home/projects/src/mw/{name}/{name}.ts"),
+            exports
+                .iter()
+                .map(|e| format!("export const {e} = () => '{e}'\n"))
+                .collect(),
+        ));
+    }
+    let entries: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let client = init_completion_client("/home/projects", &entries);
+    let main_uri = lsconv::file_name_to_document_uri("/home/projects/src/main.ts");
+    open(&client, &main_uri, "export const x = 1\n");
+    (client, main_uri)
+}
+
+/// Sets the second line of `src/main.ts` to `const y = <prefix>` and asks for
+/// completions at its end. Returns the auto-import module specifier of each
+/// label of `labels` that is in the list.
+fn auto_import_specifiers(
+    client: &LspClient,
+    u: &lsproto::DocumentUri,
+    version: i32,
+    prefix: &str,
+    labels: &[&str],
+) -> Vec<(String, String)> {
+    let line = format!("const y = {prefix}");
+    client.send_notification(
+        &lsproto::TEXT_DOCUMENT_DID_CHANGE_INFO,
+        lsproto::DidChangeTextDocumentParams {
+            text_document: lsproto::VersionedTextDocumentIdentifier {
+                uri: u.clone(),
+                version,
+            },
+            content_changes: vec![lsproto::TextDocumentContentChangePartialOrWholeDocument {
+                partial: None,
+                whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                    text: format!("export const x = 1\n{line}"),
+                }),
+            }],
+        },
+    );
+    let (msg, resp) = client.send_request(
+        &lsproto::TEXT_DOCUMENT_COMPLETION_INFO,
+        completion_params(u, 1, line.len() as u32),
+    );
+    assert!(msg.error.is_none(), "{:?}", msg.error);
+    let items = completion_items(resp);
+    labels
+        .iter()
+        .filter_map(|label| {
+            let item = find_completion_item(&items, label)?;
+            let auto_import = item.data.as_ref()?.auto_import.as_ref()?;
+            Some((label.to_string(), auto_import.module_specifier.clone()))
+        })
+        .collect()
+}
+
+child_test! {
+    // PORT: no Go counterpart (aispec1, knownprob1 S3). Go caches the
+    // auto-import specifier of each importing file by the export's Path, the
+    // file that declares it (ls/autoimport/specifiers.go GetModuleSpecifier),
+    // but computes it from the export's ModuleFileName. The `Vars` export of
+    // the augmentation has Path `src/mw/rid/index.ts` and ModuleFileName
+    // `src/index.ts`. A completion for `V` computes only that export, so it
+    // stores "." for `src/mw/rid/index.ts`, and the next completion gives
+    // `requestId` the specifier "." in place of "./mw/rid". Go N
+    // (tsgo-oracle-673a5f17d713) answers "." in 40 of 40 runs (aispec1
+    // augment-one).
+    fn augmentation_completion_sets_the_specifier_of_the_declaring_file() {
+        let (client, main_uri) = augmentation_client(&[("rid", &["requestId"])]);
+        let labels = ["requestId"];
+        assert_eq!(auto_import_specifiers(&client, &main_uri, 2, "V", &labels), []);
+        assert_eq!(
+            auto_import_specifiers(&client, &main_uri, 3, "", &labels),
+            [("requestId".to_string(), ".".to_string())]
+        );
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (aispec1, knownprob1 S3). One completion with
+    // no prefix computes the augmentation group and the groups of both
+    // files. In goport the merged augmentation export has the Path of
+    // `src/mw/b` (the last in program order), and its group is made at
+    // `src/mw/a`, before the groups of `src/mw/b`. Go merges a random last
+    // Path and computes the groups in map order: in some runs the
+    // augmentation group comes before the groups of that file and its
+    // exports get ".". goport computes augmentation groups last
+    // (autoimport/view.rs get_completions), Go's common answer: no "." in 28
+    // of 40 runs of Go N (aispec1 augment-two; in the others the four
+    // exports of one file get ".").
+    fn single_completion_computes_the_augmentation_last() {
+        let (client, main_uri) = augmentation_client(&[
+            ("a", &["aOne", "aTwo", "aThree", "aFour"]),
+            ("b", &["bOne", "bTwo", "bThree", "bFour"]),
+        ]);
+        let labels = ["aOne", "aTwo", "aThree", "aFour", "bOne", "bTwo", "bThree", "bFour"];
+        let expected: Vec<(String, String)> = labels
+            .iter()
+            .map(|label| (label.to_string(), format!("./mw/{}", &label[..1])))
+            .collect();
+        assert_eq!(auto_import_specifiers(&client, &main_uri, 2, "", &labels), expected);
+    }
+}

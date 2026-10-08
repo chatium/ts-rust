@@ -1459,6 +1459,36 @@ impl Checker {
         entry
     }
 
+    /// Go `containsType(targets, t)` for each `t` of `sources` in order, up
+    /// to the first that is not found (the loop of Go
+    /// `isTypeSubsetOfUnion`). The searches run on the entries of the
+    /// targets (`LargeSortEntry`): an entry order has Go's sign with no
+    /// effect, and a tie goes to `compare_types`, so Go's searches make Go's
+    /// comparisons in Go's order. On eslint-plugin-svelte (sources of
+    /// 43,000 to 56,000 types in unions of about the same size) the entries
+    /// decide 93% of the comparisons.
+    // PERF (unionsub1): for long searches only; making the entries costs
+    // about one comparison per type.
+    pub(crate) fn contains_types_by_entries(&self, targets: &[TypeId], sources: &[TypeId]) -> bool {
+        let table: Vec<LargeSortEntry> =
+            targets.iter().map(|&t| self.large_sort_entry(t)).collect();
+        sources.iter().all(|&t| {
+            let entry = self.large_sort_entry(t);
+            crate::gostd::slices::binary_search_func(&table, entry, |x, y| {
+                // Go's first step: the same type gives 0.
+                if x.t == y.t {
+                    return 0;
+                }
+                match x.keyed_order(y) {
+                    Ordering::Less => -1,
+                    Ordering::Greater => 1,
+                    Ordering::Equal => self.compare_types(x.t, y.t),
+                }
+            })
+            .1
+        })
+    }
+
     /// `(union_sort_key(t), t)` for each of `types`, in order.
     pub(crate) fn union_sort_keys(&self, types: &[TypeId]) -> Vec<(u128, TypeId)> {
         types.iter().map(|&t| (self.union_sort_key(t), t)).collect()
@@ -2516,6 +2546,62 @@ type U1 = (A | SvelteProgram) & (B | Box<string>) & ({ p: 1 } | SvelteShorthandA
                 sort_stable_func(&mut go, |&a, &b| c.compare_types(a, b));
                 assert_eq!(large, go, "n {n}");
             }
+        });
+    }
+
+    /// `contains_types_by_entries` (unionsub1) gives Go's answer: each
+    /// source searched with `compare_types` in Go's order of the targets,
+    /// up to the first miss. The types are those of
+    /// `large_union_sort_matches_go`; the targets lack some of them.
+    #[test]
+    fn entry_searches_match_go() {
+        with_alias_types(&format!("{SOURCE}{LARGE_SOURCE}"), |c, aliases| {
+            let mut types = aliases.to_vec();
+            for &t in aliases {
+                if c.ty(t).flags.intersects(TypeFlags::UNION) {
+                    types.extend_from_slice(c.ty(t).types());
+                }
+            }
+            types.sort_unstable();
+            types.dedup();
+            sort_stable_func(&mut types, |&a, &b| c.compare_types(a, b));
+            let go = |targets: &[TypeId], sources: &[TypeId]| {
+                sources
+                    .iter()
+                    .all(|&t| binary_search_func(targets, t, |&a, &b| c.compare_types(a, b)).1)
+            };
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let (mut found, mut missed) = (0, 0);
+            for round in 0..64 {
+                let (mut targets, mut sources) = (Vec::new(), Vec::new());
+                for &t in &types {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    if round % 2 == 0 || state % 16 != 0 {
+                        targets.push(t);
+                    }
+                    if state % 3 == 0 {
+                        sources.push(t);
+                    }
+                }
+                let want = go(&targets, &sources);
+                assert_eq!(
+                    c.contains_types_by_entries(&targets, &sources),
+                    want,
+                    "round {round}"
+                );
+                if want {
+                    found += 1
+                } else {
+                    missed += 1
+                }
+                for &t in &types {
+                    let want = go(&targets, &[t]);
+                    assert_eq!(c.contains_types_by_entries(&targets, &[t]), want, "{t:?}");
+                }
+            }
+            assert!(found > 0 && missed > 0, "{found} {missed}");
         });
     }
 }

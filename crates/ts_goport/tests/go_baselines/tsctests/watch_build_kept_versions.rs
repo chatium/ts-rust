@@ -66,7 +66,8 @@ fn session(
 }
 
 /// `(made, dead)` file versions once the dead count reaches `dead` or 10 s
-/// pass: the free thread frees the dropped versions
+/// pass: a dropped version that no other holder keeps dies on the build
+/// thread, and the free thread frees its data
 /// (`BuildHost::drop_kept_parses_whose_module_indicator_options_change`).
 fn file_versions(dead: usize) -> (usize, usize) {
     let deadline = Instant::now() + Duration::from_secs(10);

@@ -4662,44 +4662,143 @@ fn is_comment_or_blank_line(text: &str, mut pos: usize) -> bool {
 }
 
 // Go: compiler/program.go:1651 SortAndDeduplicateDiagnostics
-pub fn sort_and_deduplicate_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    // Go: compiler/program.go:1599 slices.SortFunc(diagnostics, ast.CompareDiagnostics)
-    crate::gostd::slices::sort_func(&mut diagnostics, compare_diagnostics);
-    compact_and_merge_related_infos(diagnostics)
+// PERF (startexit1): Go sorts pointers, and each compare reads the two file
+// names. The port sorts the indexes of the diagnostics with each file name
+// ranked once (`DiagnosticPaths`), so a compare reads no file name and moves
+// no diagnostic, and the merge moves each diagnostic where it cloned each
+// one. The sort makes the same compares and swaps on the indexes as on the
+// diagnostics, so the order is Go's (`gostd::slices`, `by_index`). midway
+// (10,572 diagnostic lines) sorted 7x slower than Go (perfmeas1/phase).
+pub fn sort_and_deduplicate_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let paths = DiagnosticPaths::new(&diagnostics);
+    let len = u32::try_from(diagnostics.len()).expect("under 4G diagnostics");
+    let mut order: Vec<u32> = (0..len).collect();
+    // Go: compiler/program.go:1653 slices.SortFunc(diagnostics, ast.CompareDiagnostics)
+    crate::gostd::slices::sort_func(&mut order, |&a, &b| {
+        let (a, b) = (a as usize, b as usize);
+        if a == b {
+            return 0;
+        }
+        match paths.rank(a).cmp(&paths.rank(b)) {
+            std::cmp::Ordering::Equal => {
+                compare_diagnostics_after_path(&diagnostics[a], &diagnostics[b])
+            }
+            order => order as i32,
+        }
+    });
+    compact_and_merge_related_infos(diagnostics, &order, &paths)
+}
+
+/// The Go path of each diagnostic of a list (`get_diagnostic_path`), read
+/// once per file, as an index into the distinct paths, and the rank of each
+/// distinct path in Go byte order (`compare_go_bytes`; paths with the same
+/// Go bytes have the same rank). For `sort_and_deduplicate_diagnostics`.
+struct DiagnosticPaths {
+    /// Per diagnostic: its path, as an index into `names` and `ranks`.
+    path: Vec<u32>,
+    names: Vec<&'static str>,
+    ranks: Vec<u32>,
+}
+
+impl DiagnosticPaths {
+    fn new(diagnostics: &[Diagnostic]) -> Self {
+        let mut by_file: FxHashMap<Node, u32> = FxHashMap::default();
+        let mut by_name: FxHashMap<&'static str, u32> = FxHashMap::default();
+        let mut names = Vec::new();
+        let mut last: Option<(Node, u32)> = None;
+        let path = diagnostics
+            .iter()
+            .map(|d| {
+                let file = d.file();
+                if let Some((last_file, index)) = last
+                    && last_file == file
+                {
+                    return index;
+                }
+                let index = *by_file.entry(file).or_insert_with(|| {
+                    let name = get_diagnostic_path(d);
+                    *by_name.entry(name).or_insert_with(|| {
+                        names.push(name);
+                        (names.len() - 1) as u32
+                    })
+                });
+                last = Some((file, index));
+                index
+            })
+            .collect();
+        let mut sorted: Vec<u32> = (0..names.len() as u32).collect();
+        crate::gostd::slices::stable_sort_by(&mut sorted, |&a, &b| {
+            compare_go_bytes(names[a as usize], names[b as usize])
+        });
+        let mut ranks = vec![0; names.len()];
+        let mut rank = 0;
+        for (i, &index) in sorted.iter().enumerate() {
+            if i > 0
+                && compare_go_bytes(names[sorted[i - 1] as usize], names[index as usize]).is_ne()
+            {
+                rank += 1;
+            }
+            ranks[index as usize] = rank;
+        }
+        Self { path, names, ranks }
+    }
+
+    /// The rank of the path of diagnostic `i`.
+    fn rank(&self, i: usize) -> u32 {
+        self.ranks[self.path[i] as usize]
+    }
+
+    /// Whether diagnostics `a` and `b` have the same path (Go `==` of the
+    /// paths in `equal_diagnostics_no_related_info`).
+    fn same(&self, a: usize, b: usize) -> bool {
+        self.names[self.path[a] as usize] == self.names[self.path[b] as usize]
+    }
 }
 
 // Go: compiler/program.go:1659 compactAndMergeRelatedInfos
 // Remove duplicate diagnostics and, for sequences of diagnostics that differ only by related information,
 // create a single diagnostic with sorted and deduplicated related information.
-fn compact_and_merge_related_infos(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    if diagnostics.len() < 2 {
-        return diagnostics;
-    }
-    let mut result = Vec::with_capacity(diagnostics.len());
+// PORT: `order` is the sorted order of `diagnostics` (see
+// `sort_and_deduplicate_diagnostics`). Each kept diagnostic moves to the
+// result; Go keeps the pointer, or a clone with the merged related
+// information.
+fn compact_and_merge_related_infos(
+    diagnostics: Vec<Diagnostic>,
+    order: &[u32],
+    paths: &DiagnosticPaths,
+) -> Vec<Diagnostic> {
+    let mut slots: Vec<Option<Diagnostic>> = diagnostics.into_iter().map(Some).collect();
+    let mut result = Vec::with_capacity(order.len());
     let mut i = 0;
-    while i < diagnostics.len() {
-        let d = &diagnostics[i];
+    while i < order.len() {
+        let first = order[i] as usize;
         let mut n = 1;
-        while i + n < diagnostics.len() && equal_diagnostics_no_related_info(d, &diagnostics[i + n])
+        while let Some(&next) = order.get(i + n)
+            && paths.same(first, next as usize)
+            && equal_diagnostics_no_related_info_after_path(
+                slots[first].as_ref().expect("a diagnostic not taken yet"),
+                slots[next as usize].as_ref().expect("a later diagnostic"),
+            )
         {
             n += 1;
         }
-        let mut merged = d.clone();
+        let mut d = slots[first].take().expect("each diagnostic is kept once");
         if n > 1 {
-            let mut related_infos: Vec<Diagnostic> = diagnostics[i..i + n]
-                .iter()
-                .flat_map(|x| x.related_information.iter().cloned())
-                .collect();
+            let mut related_infos: Vec<Diagnostic> = std::mem::take(&mut d.related_information);
+            for &other in &order[i + 1..i + n] {
+                let other = slots[other as usize].take().expect("a merged diagnostic");
+                related_infos.extend(other.related_information);
+            }
             // PORT: Go tests `relatedInfos != nil`; appending empty slices
             // keeps it nil, so an empty list means "leave d alone".
             if !related_infos.is_empty() {
-                // Go: compiler/program.go:1623 slices.SortFunc(relatedInfos, ast.CompareDiagnostics)
+                // Go: compiler/program.go:1677 slices.SortFunc(relatedInfos, ast.CompareDiagnostics)
                 crate::gostd::slices::sort_func(&mut related_infos, compare_diagnostics);
                 related_infos.dedup_by(|b, a| equal_diagnostics(a, b));
-                merged.set_related_info(related_infos);
             }
+            d.set_related_info(related_infos);
         }
-        result.push(merged);
+        result.push(d);
         i += n;
     }
     result
@@ -5198,6 +5297,105 @@ pub fn checker_index_of_file(file: Node) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // startexit1: the index sort with ranked file names gives the order and
+    // the merges of Go's `SortAndDeduplicateDiagnostics` (compiler/program.go:
+    // 1651): a sort of the diagnostics with `ast.CompareDiagnostics` and
+    // `compactAndMergeRelatedInfos`, as the port did before (`reference`).
+    // The files include two parses with one name, so diagnostics that compare
+    // equal but keep different file nodes show the tie order of the sort.
+    #[test]
+    fn sort_and_deduplicate_matches_the_value_sort() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        fn reference(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+            crate::gostd::slices::sort_func(&mut diagnostics, compare_diagnostics);
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < diagnostics.len() {
+                let d = &diagnostics[i];
+                let mut n = 1;
+                while i + n < diagnostics.len()
+                    && equal_diagnostics_no_related_info(d, &diagnostics[i + n])
+                {
+                    n += 1;
+                }
+                let mut merged = d.clone();
+                if n > 1 {
+                    let mut related: Vec<Diagnostic> = diagnostics[i..i + n]
+                        .iter()
+                        .flat_map(|x| x.related_information.iter().cloned())
+                        .collect();
+                    if !related.is_empty() {
+                        crate::gostd::slices::sort_func(&mut related, compare_diagnostics);
+                        related.dedup_by(|b, a| equal_diagnostics(a, b));
+                        merged.set_related_info(related);
+                    }
+                }
+                result.push(merged);
+                i += n;
+            }
+            result
+        }
+        let parse = |name: &str| {
+            let opts = SourceFileParseOptions {
+                file_name: name.to_string(),
+                ..Default::default()
+            };
+            parse_source_file(&opts, "let a = 1;\n", ScriptKind::TS).root
+        };
+        // "/B.ts" < "/a.ts" < "/a.ts" (another parse) < "/b.ts" < "/\u{e4}.ts" by bytes.
+        let files = [
+            Node::NIL,
+            parse("/b.ts"),
+            parse("/a.ts"),
+            parse("/\u{e4}.ts"),
+            parse("/B.ts"),
+            parse("/a.ts"),
+        ];
+        let messages = [
+            diag::Cannot_find_name_0,
+            diag::Cannot_redeclare_block_scoped_variable_0,
+            diag::Unused_ts_expect_error_directive,
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut make = |next: &mut dyn FnMut(u64) -> u64| {
+            let file = files[next(files.len() as u64) as usize];
+            let pos = next(4) as i32;
+            let message = messages[next(messages.len() as u64) as usize];
+            let args = vec![["x", "y"][next(2) as usize].to_string()];
+            new_diagnostic(
+                file,
+                TextRange::new(pos, pos + next(2) as i32),
+                message,
+                args,
+            )
+        };
+        let mut diagnostics = Vec::new();
+        for _ in 0..3000 {
+            let mut d = make(&mut next);
+            for _ in 0..next(3).saturating_sub(1) {
+                let related = make(&mut next);
+                d.add_related_info(Some(related));
+            }
+            diagnostics.push(d);
+        }
+        let expected = reference(diagnostics.clone());
+        let got = sort_and_deduplicate_diagnostics(diagnostics);
+        assert!(expected.len() < 1000, "the list has duplicates to merge");
+        assert!(
+            expected.iter().any(|d| d.related_information.len() > 2),
+            "some merges join related information"
+        );
+        let text = |list: &[Diagnostic]| list.iter().map(|d| format!("{d:?}")).collect::<Vec<_>>();
+        assert_eq!(text(&got), text(&expected));
+        assert!(sort_and_deduplicate_diagnostics(Vec::new()).is_empty());
+    }
 
     // Options that differ only in the `paths` order are different values:
     // each program keeps its own order.

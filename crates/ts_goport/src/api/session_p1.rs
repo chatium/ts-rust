@@ -823,6 +823,9 @@ pub fn new_standalone_session(
     // released source file lease or program frees its parse, as Go's GC
     // does.
     crate::ast::set_editor_process();
+    // Not in Go: a standalone API process answers as plain tsgo, without
+    // the Effect rules, unless TSGO_EFFECT_API=1 (`effect::rulerunner`).
+    crate::effect::rulerunner::set_api_process();
     let snapshot_host = project::new_snapshot_host(init);
     let mut s = new_session(snapshot_host, None, options);
     s.owns_snapshot_host = true;

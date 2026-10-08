@@ -87,7 +87,8 @@ impl Orchestrator {
         self.host.cached_fs.clear_cache();
         self.host.extended_config_cache.reset();
         // PORT: watch mode keeps its parses in `watch_sources` (see
-        // `BuildHost::watch_source_file`), so this one is empty.
+        // `BuildHost::watch_source_file`). This one has the `.d.ts` and
+        // `.json` parses of the cycle (`BuildHost::get_source_file`).
         self.host.source_files.reset();
         // PORT: not in Go (see `BuildHost::end_config_change_cycle`).
         self.host.end_config_change_cycle();

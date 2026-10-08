@@ -490,8 +490,7 @@ impl Checker {
         let t = self.get_reduced_apparent_type(t);
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::OBJECT) {
-            self.resolve_structured_type_members(t);
-            let members = self.ty(t).as_structured_type().members;
+            let members = self.resolve_structured_type_members(t).members;
             let mut symbol = self.symbols.get_key(members, name);
             if symbol.is_some() {
                 let t_symbol = self.ty(t).symbol;

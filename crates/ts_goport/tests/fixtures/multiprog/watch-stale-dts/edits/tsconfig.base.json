@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "removeComments": true,
+    "strict": true,
+    "types": [],
+    "outDir": "${configDir}/dist"
+  }
+}

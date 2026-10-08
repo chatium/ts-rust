@@ -572,7 +572,7 @@ static NODE_INDEX_TABLE_KEY: LazyLock<SourceFileDataKey<Rc<NodeIndexTable>>> =
     LazyLock::new(new_source_file_data_key::<Rc<NodeIndexTable>>);
 
 impl NodeIndexTable {
-    // Go: api/encoder/encoder.go:316 (*NodeIndexTable).GetIndex
+    // Go: api/encoder/encoder.go:342 (*NodeIndexTable).GetIndex
     /// GetIndex returns the encoder index for the given node.
     /// On the first call the sortedIdx array is built (O(n log n) sort on a flat []uint32),
     /// then subsequent calls use binary search (O(log n)). This turns out to be much faster than
@@ -2137,6 +2137,28 @@ exports.x = 1;
             "let s = '\\ud800'; let id\\u0061 = 1; let \u{e9} = 'é'; // non-ASCII\nconst bad = `\\x`;\n",
         ),
         ("f.ts", "class C { m( { } \nlet = ; }} ) => ;\nfunction (\n"),
+        // followups32: fields that the texts above leave out. A JS
+        // function's `@type` gives its `FullSignature`, which has no mask
+        // bit (parser/reparser.go:396), and an assignment declaration's
+        // `@type` gives its BinaryExpression a `Type` (:377).
+        (
+            "g.js",
+            r#"/** @type {(a: string, b?: number) => void} */
+function typed(a, b) {}
+/** @type {number} */
+exports.y = 1;
+/** @type {string} */
+module.exports.z = "z";
+"#,
+        ),
+        // A shorthand property with an initializer in a destructuring
+        // assignment, a definite assignment `!`, optional tuple members and
+        // two MissingDeclarations: decorators with no declaration
+        // (parser/parser.go:1188) and a decorated expression (:5790).
+        (
+            "h.ts",
+            "({ a = 1, b: [c] = [] } = o);\nlet x!: number;\ntype OptTup = [string?, number?];\n@dec;\nconst md = @dec 1;\n",
+        ),
     ];
 
     /// Encodes `text` as `file_name` with the node data walk and with the

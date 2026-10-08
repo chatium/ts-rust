@@ -1255,7 +1255,32 @@ pub fn visibility_to_string(flags: ModifierFlags) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct ErrorState {
     pub error_chain: Option<Rc<ErrorChain>>,
-    pub related_info: Vec<Diagnostic>,
+    pub related_info: RelatedInfo,
+}
+
+/// Go `[]*ast.Diagnostic` of `errorState.relatedInfo` and
+/// `Relater.relatedInfo`.
+///
+/// PERF: shared, so a saved error state (`get_error_state`) and each copy of
+/// it copy a pointer, as Go copies a slice header. A push copies the list
+/// when a saved state holds it, so a saved state keeps the list it saw, as
+/// the port's `Vec` copies did. Empty is `None`, with no allocation.
+#[derive(Clone, Debug, Default)]
+pub struct RelatedInfo(Option<Rc<Vec<Diagnostic>>>);
+
+impl RelatedInfo {
+    /// Go `append(relatedInfo, d)`.
+    pub fn push(&mut self, d: Diagnostic) {
+        Rc::make_mut(self.0.get_or_insert_with(Default::default)).push(d);
+    }
+
+    pub fn as_slice(&self) -> &[Diagnostic] {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = None;
+    }
 }
 
 // Go: checker/relater.go:2574 ErrorChain
@@ -1281,7 +1306,7 @@ pub struct Relater {
     pub kind: RelationKind,
     pub error_node: Node,
     pub error_chain: Option<Rc<ErrorChain>>,
-    pub related_info: Vec<Diagnostic>,
+    pub related_info: RelatedInfo,
     pub maybe_keys: Vec<RelationKey>,
     // PORT: perf. Go keeps the set in sync with `maybeKeys` at all times.
     // Here it is empty while `maybe_keys.len() <= MAYBE_KEYS_SCAN_LIMIT` and
@@ -2265,5 +2290,56 @@ type T9 = Uppercase<string>;
                 "{kept} {matched}"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod related_info_tests {
+    use super::*;
+
+    /// A saved `RelatedInfo` (an error state) keeps the list it saw when the
+    /// relater pushes after the save, and after a restore and a new push, as
+    /// Go's `errorState` keeps its slice header (relater.go:3212, :3219).
+    #[test]
+    fn a_saved_state_keeps_its_related_info() {
+        let message = diag::X_0_is_declared_here;
+        let d = |name: &str| {
+            new_diagnostic(
+                Node::NIL,
+                TextRange::new(0, 0),
+                message,
+                vec![name.to_string()],
+            )
+        };
+        let names = |info: &RelatedInfo| -> Vec<String> {
+            info.as_slice()
+                .iter()
+                .map(|d| d.message_args[0].clone())
+                .collect()
+        };
+        let mut info = RelatedInfo::default();
+        let empty = info.clone();
+        info.push(d("a"));
+        let saved = info.clone();
+        info.push(d("b"));
+        assert_eq!(
+            (names(&empty), names(&saved), names(&info)),
+            (vec![], vec!["a".to_string()], vec!["a".into(), "b".into()])
+        );
+        // Restore, then push again: the saved state and the dropped list do
+        // not change.
+        let dropped = info;
+        info = saved.clone();
+        info.push(d("c"));
+        assert_eq!(
+            (names(&saved), names(&dropped), names(&info)),
+            (
+                vec!["a".to_string()],
+                vec!["a".into(), "b".into()],
+                vec!["a".into(), "c".into()]
+            )
+        );
+        info.clear();
+        assert!(info.as_slice().is_empty());
     }
 }

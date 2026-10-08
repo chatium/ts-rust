@@ -110,7 +110,7 @@ fn main() {
     budget.install();
     // After the exec in `set_malloc_tunables`: an exec resets the handlers,
     // and a raised limit would read as the original one there.
-    go_runtime_start();
+    let signals = go_runtime_start();
     // Go: `System.SinceStart` counts from the process start. The tunables
     // step above may exec the binary again, so the clock starts after it.
     let start = Instant::now();
@@ -123,15 +123,28 @@ fn main() {
     let work = ts_goport::core::GoThread::new()
         .name("tsgo".to_string())
         .stack_size(ts_goport::gostd::stack::max_stack_size())
-        .spawn(move || exit(run_main(start)));
-    // Reached only when `run_main` panics. The write drops its error, as
-    // the panic hook's do: `eprintln!` panics when stderr is a pipe with no
-    // reader, and this panic of the main thread ended the run with exit
-    // code 101. A Go panic does not raise SIGPIPE (the runtime drops its
-    // write errors), so this keeps exit code 70 with no reader
-    // (`tests/tsgo_panic_hook.rs`).
+        .spawn(move || {
+            let _ = catch_unwind(AssertUnwindSafe(|| exit(run_main(start))));
+            // Reached only when `run_main` panics. The write drops its
+            // error, as the panic hook's do: `eprintln!` panics when stderr
+            // is a pipe with no reader. A Go panic does not raise SIGPIPE
+            // (the runtime drops its write errors), so this keeps exit code
+            // 70 with no reader (`tests/tsgo_panic_hook.rs`). The work
+            // thread ends the process here: this thread waits for signals.
+            let _ = writeln!(std::io::stderr(), "tsgo: work thread failed");
+            std::process::exit(EXIT_UNPORTED)
+        });
+    // PERF (startexit1): this thread waits for the signals that end the
+    // run (`go_runtime_start`), where a thread of its own did: each thread
+    // is a stack, a malloc arena and a teardown at exit in every run.
+    #[cfg(target_os = "linux")]
+    if let Some(signals) = signals {
+        wait_go_signals(signals);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = signals;
+    // The work thread ends the process (above), so this join does not end.
     let _ = work.join();
-    let _ = writeln!(std::io::stderr(), "tsgo: work thread failed");
     std::process::exit(EXIT_UNPORTED);
 }
 
@@ -718,16 +731,13 @@ fn drop_go_signals() {
 /// 129, where the default action would do nothing), the soft open-file
 /// limit goes up to one below the hard limit
 /// (`gostd::rlimit::raise_open_file_limit`), and fd 1 is checked for
-/// `O_NONBLOCK`, as Go `os.NewFile` does at start (`stdio::init`). The
-/// thread for the thrown signals and SIGHUP waits on a pipe until one
-/// comes. Go throws in the signal handler, with no thread. The port's
-/// thread starts as a Go runtime thread does (`GoThread`): when the OS
-/// refuses it, the run ends with Go's text and exit 2. Going on without it
-/// would drop the thrown signals and SIGHUP (dropping `signals` removes
-/// their actions, not their handlers).
+/// `O_NONBLOCK`, as Go `os.NewFile` does at start (`stdio::init`).
+/// Returns the thrown signals and SIGHUP, for which the main thread waits
+/// on a pipe (`wait_go_signals`). Go throws in the signal handler, with no
+/// thread. None when they cannot be registered.
 /// PORT: other systems than Linux keep the default actions (Go's tables
 /// differ there).
-fn go_runtime_start() {
+fn go_runtime_start() -> Option<GoSignals> {
     ts_goport::execute::tsc::stdio::init();
     ts_goport::gostd::rlimit::raise_open_file_limit();
     #[cfg(target_os = "linux")]
@@ -735,21 +745,30 @@ fn go_runtime_start() {
         drop_go_signals();
         let thrown = GO_THROWN.iter().map(|(signal, _)| signal.as_raw());
         let hup = (!hup_ignored()).then_some(signal_hook::consts::SIGHUP);
-        let Ok(mut signals) = signal_hook::iterator::Signals::new(thrown.chain(hup)) else {
-            return;
-        };
+        let signals = signal_hook::iterator::Signals::new(thrown.chain(hup)).ok()?;
         end_default_actions(&THROWN_DEFAULT);
-        ts_goport::core::GoThread::new()
-            .name("go-signals".to_string())
-            .spawn(move || {
-                // Each one ends the process.
-                if let Some(signal) = signals.forever().next() {
-                    match GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
-                        Some((_, name)) => throw(name),
-                        None => die_from_signal(signal),
-                    }
-                }
-            });
+        Some(signals)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// The signals that `go_runtime_start` registers (Linux), or none.
+#[cfg(target_os = "linux")]
+type GoSignals = signal_hook::iterator::Signals;
+#[cfg(not(target_os = "linux"))]
+type GoSignals = std::convert::Infallible;
+
+/// Waits for a signal of `signals` (`go_runtime_start`) and ends the
+/// process by it: a signal that Go throws (`throw`) or SIGHUP
+/// (`die_from_signal`). Returns only when the wait fails.
+#[cfg(target_os = "linux")]
+fn wait_go_signals(mut signals: GoSignals) {
+    if let Some(signal) = signals.forever().next() {
+        match GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
+            Some((_, name)) => throw(name),
+            None => die_from_signal(signal),
+        }
     }
 }
 

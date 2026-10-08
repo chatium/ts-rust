@@ -29,6 +29,21 @@ and "Types" sections and follow them. This file adds the Effect rules.
 - If something cannot be ported, call `unported!("goName")` there. Never
   return a guessed value. List every `unported!` in your final answer.
 
+## Where the port differs from the reference
+
+- Patch 002 runs the rules inside the type-check block of
+  `checkSourceFile`, before the unused-identifier check. The port runs them
+  after that check, once per file (`SourceFileLinks.effect_checked`,
+  `checker/checker_p03.rs`). A rule's type queries can mark a name
+  referenced, for example the parameter of an `x is T` type predicate, and
+  the reference then loses TS6133 for it. With the plugin the unused check
+  always runs before the rules. Without `noUnusedLocals` and
+  `noUnusedParameters` it adds only suggestions (Go `reportUnused`), so
+  `tsc` output does not change, and a later suggestion request gets the
+  TS6133 that plain tsgo gives.
+- A standalone API process runs no rules unless `TSGO_EFFECT_API=1`
+  (`rulerunner::enabled_options`).
+
 ## Go shim -> Rust
 
 Effect code calls typescript-go through `github.com/microsoft/TypeScript/tsc/shim/...`.

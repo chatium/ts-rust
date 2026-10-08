@@ -1426,10 +1426,10 @@ impl Checker {
                 } else if is_property_assignment(p) {
                     let name = self.sym(symbol).name.clone();
                     self.is_possibly_discriminant_value(p.initializer())
-                        && self.is_discriminant_property(contextual_type, &name)
+                        && self.is_discriminant_property_key(contextual_type, TableKey::Name(&name))
                 } else if is_shorthand_property_assignment(p) {
                     let name = self.sym(symbol).name.clone();
-                    self.is_discriminant_property(contextual_type, &name)
+                    self.is_discriminant_property_key(contextual_type, TableKey::Name(&name))
                 } else {
                     false
                 };
@@ -1443,7 +1443,7 @@ impl Checker {
                 let name = self.sym(s).name.clone();
                 if self.sym(s).flags.intersects(SymbolFlags::OPTIONAL)
                     && self.symbols.get(node_members, &name).is_nil()
-                    && self.is_discriminant_property(contextual_type, &name)
+                    && self.is_discriminant_property_key(contextual_type, TableKey::Name(&name))
                 {
                     discriminant_members.push(s);
                 }

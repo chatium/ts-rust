@@ -753,7 +753,7 @@ pub struct RegistryChange {
 
 /// PORT: marks a registry build whose result the caller drops when the
 /// context is cancelled: the auto-import warm (`Session::run_pending_warm`,
-/// Go session.go:1844). No Go counterpart. Go runs the warm on a goroutine,
+/// Go session.go:2111). No Go counterpart. Go runs the warm on a goroutine,
 /// so no request waits for it. Here it runs on the dispatch thread, so a
 /// cancelled warm must stop within about a millisecond. A build without the
 /// key (a request) keeps Go's cancel points, because Go adopts its clone

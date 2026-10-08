@@ -21,7 +21,9 @@
 //! compiles makes its program at once (`build_project_start`) and starts
 //! its check on the program's checker threads, so the checkers of the
 //! started tasks work at the same time, as the Go goroutines do. Each
-//! checker emits when its check ends, and the emit keeps its writes in
+//! checker emits when its check ends (a task that checks nothing, as with
+//! cached semantic diagnostics, `noCheck` or a syntax error, emits at
+//! once), and the emit keeps its writes in
 //! memory. The started tasks write their outputs one at a time
 //! (`build_project_finish`), in the order their check and emit end, as each
 //! Go builder writes when its own task ends. PORT (determinism): when tasks

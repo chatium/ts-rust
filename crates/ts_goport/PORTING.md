@@ -408,9 +408,13 @@ methods reach the AST through it.
   reuse, never undefined behavior. Its kind column is never reused, so a
   stale kind read gives the old kind. Its store, `GoFile`, extras, flow,
   node data and list reads panic. Every holder of a node of a version
-  holds the version, so a correct reader never sees a reuse; the
-  debug-assertion runs (protected tests, the corpus, and the editor and
-  oracle runs) find a missed holder. This is the owner check that the R141
+  holds the version, so a correct reader never sees a reuse. No standing
+  run has debug assertions: the protected tests run `--release`
+  (`build-goport-tests.sh`), and the corpus, editor and oracle runs use
+  release bins. So those runs find a missed holder only through the
+  release checks (the binder field reads above and the reads that
+  panic). A debug test build (`cargo test` without `--release`) also
+  checks each header and kids read. This is the owner check that the R141
   reviewer asked for before any step that reuses records: it replaces step
   2's tripwire (`freeable_version_owns_its_lists_and_a_stale_read_panics`
   reads the old values inside the quarantine), and
@@ -525,6 +529,12 @@ The batch that adds it is not accepted until Theo approves.
   does not change, no watch event names it and no build of the cycle
   wrote it (`BuildHost::watch_source_file`, as Go `tsc --watch` keeps its
   files), so a cycle parses only the changed files, on the loading thread.
+  A `.d.ts` or `.json` file still comes through `source_files` (Go
+  `sourceFiles`) first, which keeps the first parse of a cycle until the
+  cycle ends, as in Go: a project that builds beside an upstream project
+  (no reference) can read the upstream `.d.ts` before that build writes
+  it, and a downstream project of the same cycle then gets the old parse
+  (bwsig1, `build_watch_keeps_the_first_dts_parse_of_a_cycle`).
   A config change keeps the parses too: their key holds the parse options,
   and a parse with other module indicator options that it did not read is
   kept as a copy, as in `tsc --watch`
@@ -559,9 +569,10 @@ The batch that adds it is not accepted until Theo approves.
   `GOPORT_OWNED_NODES=0` turns them off) its parse was a freeable parse
   (`enter_freeable_parse`, opened by the parse cache), so its store owns
   its astdata nodes, pending lists, JSDoc cache and parse diagnostics
-  (`OwnedAst`), and they are freed with the version; its node data reads
-  are pinned reads, and its lists are `StoreList` handles. Only with them
-  do 1000-edit sessions pass memory. Their cost against R139 (M3g, pin B):
+  (`OwnedAst`), and they are freed with its store, when the version dies
+  or after it on a free thread (`FileVersion::take_data`); its node data
+  reads are pinned reads, and its lists are `StoreList` handles. Only with
+  them do 1000-edit sessions pass memory. Their cost against R139 (M3g, pin B):
   session instructions +6.40% on effect and +4.68% on query-core (+2.2%
   with owned nodes off); edit median +0.5 to +2.1 ms on effect and +0.8 to
   +1.7 ms on query-core in 200-edit sessions, +0.9 ms (query-core) and
@@ -891,6 +902,22 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   checker. `GOPORT_DTS_TWIN=0` turns the twins off.
   `GOPORT_DTS_TWIN_CHECK=1` also prints each part on the checker, and the
   twin panics when its writes differ.
+- The content mapper host is dispatch-thread state (`contentmapper`
+  module docs). Each mapper connection (`contentmapper::muxconn::MuxConn`)
+  reads on its own thread, as Go's `AsyncConn.Run` goroutine does, and
+  answers a request from the mapper on a short thread (Go `handlers.Go`).
+  Once the loader's transform of a first file of a mapper opened the
+  mapper project, the parse workers send the transform requests of the
+  later files of that mapper (`ConcurrentTransform`) and parse the virtual
+  texts, as Go's parse goroutines do. The loader takes each result in load
+  order (`take_prefetched_mapped`), so a file gets one request, and the
+  ids, diagnostics and failure budget are those of a serial load. Mapped
+  jobs have their own workers (`GOPORT_MAPPED_THREADS`, default the parse
+  worker count), because such a job mostly waits for the mapper. The
+  compiler host, the `tsc -b` project host and the watch host take part
+  (`CompilerHost::prefetch_content_mapped`); the language server
+  transforms on its dispatch thread. `GOPORT_MAPPED_PREFETCH=0` turns the
+  worker transforms off.
 - A thread that runs Go code (the work thread of a binary, the parse,
   bind, checker, emit, search and goroutine threads, the `tsc -b` config
   and build info threads, the file watcher thread and the LSP read thread)

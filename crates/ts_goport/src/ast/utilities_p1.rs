@@ -182,7 +182,10 @@ fn freed_lineage_read(chunk: usize) -> ! {
 struct OwnSymbolIds {
     /// The arena whose ids are in `ids`, or 0.
     key: u32,
-    /// Dense, by place among the arena's own symbols; 0 means no id yet.
+    /// By place among the arena's own symbols (`SymbolIds::own_place`); 0
+    /// means no id yet. The places are dense until a catch-up of the arena
+    /// passes its own tail. After that, each odd chunk that the lineage
+    /// passed is a gap of 256 places (2 KiB) here.
     ids: Vec<u64>,
     /// The ids of the other arenas.
     others: FxHashMap<u32, Vec<u64>>,

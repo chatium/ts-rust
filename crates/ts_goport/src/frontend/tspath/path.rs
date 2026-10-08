@@ -386,7 +386,8 @@ pub fn get_root_length(path: &str) -> usize {
 // memchr and memrchr pick their SIMD code at run time. The byte loops they
 // replace were vectorized or not by the PGO profile alone: in the R175
 // release build the language server, whose loader resolves each import name
-// itself, paid about 5x the instructions here (studies/edbisect1).
+// itself, paid about 5x the instructions here (state note
+// edbisect1-2026-10-06, `scripts/state history --kind note`).
 pub fn get_directory_path(path: &str) -> String {
     let path = normalize_slashes_cow(path);
 

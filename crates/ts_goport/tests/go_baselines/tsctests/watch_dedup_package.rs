@@ -148,3 +148,67 @@ fn build_watch_takes_the_kept_parse_of_a_deduplicated_ts_package_copy() {
         },
     );
 }
+
+/// `(made, dead)` file versions once the dead count reaches `dead` or 10 s
+/// pass: a dropped version can die on the free thread.
+fn file_versions(dead: usize) -> (usize, usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        ts_goport::program::wait_for_background_releases();
+        let now = (
+            ts_goport::ast::file_versions_made(),
+            ts_goport::ast::dead_file_versions(),
+        );
+        if now.1 >= dead || std::time::Instant::now() > deadline {
+            return now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn watch_frees_each_new_parse_of_the_left_out_package_copy() {
+    run_test_in_child(
+        "tsctests::watch_dedup_package::watch_frees_each_new_parse_of_the_left_out_package_copy",
+        || {
+            // followups31 (R177 reviewer item 2): edits of `pb`'s copy of
+            // `dep`, which keeps the shared version, so each build leaves
+            // it out. Go builds again after each edit and gives the error
+            // of the first build (followups31/runs/ddleft-w, Go N). Each
+            // new parse of the copy is a freeable version
+            // (`watcher::note_kept_parse`), and the one before it dies.
+            // Before watchfix1 each one was a static store that lived
+            // until exit (made and dead stay 0): 9 MiB for each edit of a
+            // 335 KB copy.
+            let sys = new_in_process_test_sys(&input(".d.ts"));
+            let args: Vec<String> = ["--watch", "--pretty", "false"]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect();
+            let result = command_line_in_process(&context::background(), &sys, &args);
+            let mut w = result
+                .watcher
+                .expect("expected Watcher to be non-nil in watch mode");
+            let fs = sys.fs_from_file_map();
+            let copy = format!("{PROJECT}/node_modules/pb/node_modules/dep/index.d.ts");
+            assert_eq!(file_versions(0), (0, 0), "first build");
+            for edit in 1..=3 {
+                sys.set_output_bytes(Vec::new());
+                let text = format!("export interface D {{ label: number; edit{edit}: true }}\n");
+                let _ = fs.write_file(&copy, &text);
+                sys.mock_watch_backend().send_events(vec![Event {
+                    kind: EventKind::Update,
+                    path: copy.clone(),
+                }]);
+                w.do_cycle();
+                let out = sys.output_text();
+                assert!(
+                    out.contains(DEDUP_ERROR)
+                        && out.contains("Found 1 error. Watching for file changes."),
+                    "edit {edit}: {out}"
+                );
+                assert_eq!(file_versions(edit - 1), (edit, edit - 1), "edit {edit}");
+            }
+        },
+    );
+}

@@ -2171,14 +2171,34 @@ impl Checker {
     }
 
     // Go: checker/relater.go:5026 isDistributionDependent
+    // PERF: the root keeps the answer of the first walk
+    // (`ConditionalRoot::distribution_dependent`), and a repeat call returns
+    // it. Go walks the result type nodes on every call (vue-macros: 590,519
+    // calls on 93 roots). The walk reads the AST and the symbols that
+    // `get_symbol_from_type_reference` and `get_resolved_symbol` resolve; the
+    // first walk resolves and caches them (Go's effects, as Go makes them),
+    // and the cached links never change, so a repeat walk has no effect and
+    // gives the same answer.
     pub fn is_distribution_dependent(&mut self, root: &Rc<RefCell<ConditionalRoot>>) -> bool {
-        let (is_distributive, check_type, node) = {
+        let (is_distributive, check_type, node, known) = {
             let rb = root.borrow();
-            (rb.is_distributive, rb.check_type, rb.node)
+            (
+                rb.is_distributive,
+                rb.check_type,
+                rb.node,
+                rb.distribution_dependent,
+            )
         };
-        is_distributive
-            && (self.is_type_parameter_possibly_referenced(check_type, node.true_type())
-                || self.is_type_parameter_possibly_referenced(check_type, node.false_type()))
+        if !is_distributive {
+            return false;
+        }
+        if let Some(known) = known {
+            return known;
+        }
+        let result = self.is_type_parameter_possibly_referenced(check_type, node.true_type())
+            || self.is_type_parameter_possibly_referenced(check_type, node.false_type());
+        root.borrow_mut().distribution_dependent = Some(result);
+        result
     }
 
     // Go: checker/relater.go:5030 traceUnionsOrIntersectionsTooLarge
@@ -2221,5 +2241,59 @@ impl Checker {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod distribution_dependent_tests {
+    use super::*;
+    use crate::checker::utilities_p1::union_sort_tests::with_alias_types;
+
+    /// `is_distribution_dependent` gives the answer of Go's walk
+    /// (relater.go:5026, checker.go:22823) on the first call and on a repeat,
+    /// and the root keeps it after the first call. A root that is not
+    /// distributive keeps nothing. The roots: `T` in the true type, `T` in
+    /// the false type, `T` in neither, a `typeof` of a value outside the
+    /// alias (resolved by the first walk), and `[T]`, not distributive.
+    #[test]
+    fn the_root_keeps_the_distribution_dependence() {
+        const SOURCE: &str = r#"
+declare const v: string;
+type A<T> = T extends string ? T[] : never;
+type B<T> = T extends string ? number : { x: T };
+type C<T> = T extends string ? number : boolean;
+type D<T> = T extends string ? typeof v : 0;
+type E<T> = [T] extends [string] ? T : never;
+"#;
+        let got = with_alias_types(SOURCE, |c, types| {
+            types
+                .iter()
+                .map(|&t| {
+                    let root = c.ty(t).as_conditional_type().root.clone();
+                    let before = root.borrow().distribution_dependent;
+                    let first = c.is_distribution_dependent(&root);
+                    let kept = root.borrow().distribution_dependent;
+                    let (check_type, node) = {
+                        let rb = root.borrow();
+                        (rb.check_type, rb.node)
+                    };
+                    let walk = c
+                        .is_type_parameter_possibly_referenced(check_type, node.true_type())
+                        || c.is_type_parameter_possibly_referenced(check_type, node.false_type());
+                    let repeat = c.is_distribution_dependent(&root);
+                    (before, first, kept, walk, repeat)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            got,
+            vec![
+                (None, true, Some(true), true, true),
+                (None, true, Some(true), true, true),
+                (None, false, Some(false), false, false),
+                (None, false, Some(false), false, false),
+                (None, false, None, true, false),
+            ]
+        );
     }
 }

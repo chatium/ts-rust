@@ -4,7 +4,9 @@
 //   { "fails": bool, "has": [substrings that must appear], "lacks": [substrings that must not] }
 // Every fixture runs with our tsc and, when --ref is given, the reference
 // Effect-patched tsc. Both must meet the expectations, and their Effect
-// diagnostic lines (TS377xxx) must be identical.
+// diagnostic lines (TS377xxx) must be identical. An optional "ref" object
+// replaces fails/has/lacks for the reference, where it has a known bug
+// ("refNote" says which).
 //
 // usage: node scripts/effect/focused-fixtures.mjs --ours <tsc> [--ref <tsc>] --modules <node_modules dir with effect>
 //          [--filter NAME] [--work DIR]
@@ -58,9 +60,10 @@ for (const name of fs.readdirSync(work).sort()) {
   if (args.ref) results.ref = await check(args.ref, dir);
   const problems = [];
   for (const [who, r] of Object.entries(results)) {
-    if ((r.code !== 0) !== expect.fails) problems.push(`${who}: exit ${r.code}, expected ${expect.fails ? "failure" : "success"}`);
-    for (const s of expect.has) if (!r.out.includes(s)) problems.push(`${who}: missing ${JSON.stringify(s)}`);
-    for (const s of expect.lacks) if (r.out.includes(s)) problems.push(`${who}: unexpected ${JSON.stringify(s)}`);
+    const exp = who === "ref" && expect.ref ? { ...expect, ...expect.ref } : expect;
+    if ((r.code !== 0) !== exp.fails) problems.push(`${who}: exit ${r.code}, expected ${exp.fails ? "failure" : "success"}`);
+    for (const s of exp.has) if (!r.out.includes(s)) problems.push(`${who}: missing ${JSON.stringify(s)}`);
+    for (const s of exp.lacks) if (r.out.includes(s)) problems.push(`${who}: unexpected ${JSON.stringify(s)}`);
   }
   if (results.ref && effectLines(results.ours.out) !== effectLines(results.ref.out)) problems.push("ours and ref Effect diagnostics differ");
   if (problems.length) {

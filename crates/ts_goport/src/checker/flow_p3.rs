@@ -127,6 +127,8 @@ impl Checker {
 
     // Go: checker/flow.go:1933 isExhaustiveSwitchStatement
     pub fn is_exhaustive_switch_statement(&mut self, node: Node) -> bool {
+        // flowskip1 verify: an effect site (flow_skip.rs).
+        self.flow_skip.effects += 1;
         let state = self.switch_statement_links.get(node).exhaustive_state;
         if state == ExhaustiveState::UNKNOWN {
             // Indicate resolution is in process
@@ -283,6 +285,8 @@ impl Checker {
     pub fn get_effects_signature(&mut self, node: Node) -> SignatureId {
         let mut signature = self.signature_links.get(node).effects_signature;
         if signature.is_nil() {
+            // flowskip1 verify: an effect site (flow_skip.rs).
+            self.flow_skip.effects += 1;
             // A call expression parented by an expression statement is a potential assertion. Other call
             // expressions are potential type predicate function calls. In order to avoid triggering
             // circularities in control flow analysis, we use getTypeOfDottedName when resolving the call
@@ -1002,6 +1006,8 @@ impl Checker {
 
     // Go: checker/flow.go:2513 isReachableFlowNode
     pub fn is_reachable_flow_node(&mut self, flow: FlowNodeId) -> bool {
+        // flowskip1 verify: an effect site (flow_skip.rs).
+        self.flow_skip.effects += 1;
         let f = self.get_flow_state();
         let result = self.is_reachable_flow_node_worker(&f, flow, false /*noCacheCheck*/);
         self.put_flow_state(f);
@@ -1255,6 +1261,8 @@ impl Checker {
         let links = self.node_links.get(parent);
         if !links.flags.intersects(NodeCheckFlags::ASSIGNMENTS_MARKED) {
             links.flags |= NodeCheckFlags::ASSIGNMENTS_MARKED;
+            // flowskip1 verify: an effect site (flow_skip.rs).
+            self.flow_skip.effects += 1;
             if !self.has_parent_with_assignments_marked(parent) {
                 let mark_node_assignments = self.mark_node_assignments.clone();
                 mark_node_assignments(self, parent);

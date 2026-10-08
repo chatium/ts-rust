@@ -1100,6 +1100,23 @@ pub(crate) fn adopted_package_jsons() -> usize {
     ADOPTED_PACKAGE_JSONS.with(Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice to make the loads on this thread wait for the
+    /// answers of the parse workers (`set_answer_wait`).
+    static ANSWER_WAIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the loader's resolver on this thread wait in
+/// `SharedResolutionCache::get_module` until a parse worker stores the
+/// answer of the key (up to 60 s), so the loader takes the worker's answer
+/// whatever the timing (tests). Only for keys that a worker resolves: a
+/// key that none resolves waits the 60 s, then the loader resolves it.
+#[cfg(test)]
+pub(crate) fn set_answer_wait(on: bool) {
+    ANSWER_WAIT.with(|wait| wait.set(on));
+}
+
 /// Keeps `text`, the text of the package.json `file_name` that the
 /// resolver of the parse worker on this thread just read, for the entry
 /// that the read makes (`Caches::worker_package_json_read`).
@@ -1144,7 +1161,29 @@ impl SharedResolutionCache {
     /// Go `moduleResolutionCache.Get`.
     #[must_use]
     pub fn get_module(&self, key: &dyn ModuleKey) -> Option<SharedResolution<Arc<ResolvedModule>>> {
+        #[cfg(test)]
+        if ANSWER_WAIT.with(Cell::get) {
+            return self.wait_for_module(key);
+        }
         lock_shared(&self.modules).get(key).cloned()
+    }
+
+    /// `get_module` on a thread that waits for the answers of the parse
+    /// workers (`set_answer_wait`): up to 60 s for a worker to store the
+    /// answer of `key`.
+    #[cfg(test)]
+    fn wait_for_module(
+        &self,
+        key: &dyn ModuleKey,
+    ) -> Option<SharedResolution<Arc<ResolvedModule>>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let found = lock_shared(&self.modules).get(key).cloned();
+            if found.is_some() || std::time::Instant::now() > deadline {
+                return found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Calls `f` with the resolve-ahead calls of each module answer and

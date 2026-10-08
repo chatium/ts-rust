@@ -215,7 +215,7 @@ The script checks limits in the supplied history. For a state directory it also 
 
 ## Approved rule changes
 
-The 2026-09-28 [protected set](#protected-set) change is the newest rule change. The opt-in crate rule, its extensions and the roster carry-forward below apply only to batches that use the legacy roster. They stay so that old records still pass the check. The pin-bump rule applies to all batches.
+The 2026-10-07 light path below is the newest rule change. Before it, the 2026-09-28 [protected set](#protected-set) change was the newest. The opt-in crate rule, its extensions and the roster carry-forward below apply only to batches that use the legacy roster. They stay so that old records still pass the check. The pin-bump rule applies to all batches.
 
 Theo approved two scoped rule changes on 2026-09-25 for batch
 `recovery-continuation-go-checker-port-1`. They are saved in
@@ -291,6 +291,19 @@ was an equal `roster_fp.py` fingerprint, recorded in `batch.rosterFingerprint` a
 The [protected set](#protected-set) retired this rule on the same day, with the roster.
 Batches that use the goport protected set have no roster to carry. The check script
 keeps the rule only to check old records. No new batch can use it.
+
+### Light path for docs, tooling and simple fixes (2026-10-07)
+
+Theo approved it on 2026-10-07: "I don't think we need our full conformance and testing suite for simple fixes and readme changes. Feel free to YOLO those a little bit." (state note `theo-approvals-2026-10-07`).
+
+- **Docs and README changes, and scripts and tooling fixes** that do not change a protected tool's results go to `main` directly. They need no revision and no verdicts.
+- **A simple code fix** (small, focused, with a test that fails without it) needs:
+  - its focused tests;
+  - `goport-tests.sh` against the last accepted revision with 0 lost;
+  - bin identity on the 4 gate projects.
+
+  Then it merges to `main` without a revision. The next integration measures it in the full protected set as usual. A loss found there is a regression of that revision.
+- **Changes to the checker, the loader or the language server that can move output** keep the full path: a lane, a skeptic, an integration and a revision with two verdicts.
 
 Any other rule change still needs Theo's approval.
 

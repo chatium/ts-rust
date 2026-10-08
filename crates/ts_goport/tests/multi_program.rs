@@ -18,6 +18,9 @@
 //! The build test runs `goport_build -b` on `fixtures/multiprog/build-dedup`,
 //! whose projects share parsed files in one process, as Go `tsc -b` does.
 //!
+//! The serial bind test runs `goport_typesyms` and `tsgo` with one bind
+//! thread and with four, and compares their outputs.
+//!
 //! `pair` writes these files to its out dir: `a.txt`, `a.status`, `b.txt`,
 //! `b.status`, `b.reused` and, with `--first`, `first.txt`. A status file
 //! holds the decimal exit code. `b.reused` holds `true` or `false`.
@@ -55,6 +58,11 @@ const WATCH_BUILD_FIXTURE: &str = concat!(
 const WATCH_CONFIG_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/multiprog/watch-config"
+);
+
+const WATCH_STALE_DTS_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/multiprog/watch-stale-dts"
 );
 
 const BUILD_DEDUP_FIXTURE: &str = concat!(
@@ -816,6 +824,74 @@ fn build_watch_config_edits_of_emit_options_print_like_go() {
     );
 }
 
+/// bwsig1: Go `tsc -b --watch` keeps the `.d.ts` and `.json` parses of a
+/// cycle until the cycle ends (build/host.go `GetSourceFile`,
+/// build/orchestrator.go `resetCaches`). `side` has no reference to `lib`
+/// but imports its output `lib/dist/a.d.ts`, so it builds beside `lib` and
+/// reads that file before `lib` writes it. The edit turns on
+/// `removeComments` in the base config: every project builds again, and
+/// `lib` writes `a.d.ts` without its comment. `app` references `lib`,
+/// builds after it and gets the parse that `side` made: its build info
+/// keeps the old version of `a.d.ts` and no signature for `index.ts`.
+/// `expected.txt` (the output up to the end of the second build) and
+/// `expected-app.tsbuildinfo.json` are from `tsgo-oracle-673a5f17d713` for
+/// the same steps (10 of 10 runs).
+// PORT: no Go counterpart; the output is Go's.
+#[test]
+fn build_watch_keeps_the_first_dts_parse_of_a_cycle() {
+    let root = scratch_dir("watch-stale-dts");
+    // Go `CanWatchDirectory` does not watch `/tmp/<dir>/project`
+    // (`watch_frees_file_versions`).
+    let project = root.join("work").join("project");
+    copy_dir(Path::new(WATCH_STALE_DTS_FIXTURE), &project);
+    // The first build builds `side` before `lib` writes `a.d.ts` (TS2307,
+    // as in Go); the second builds `side` again with it.
+    for expect_success in [false, true] {
+        let build = Command::new(env!("CARGO_BIN_EXE_tsgo"))
+            .args(["-b", "tsconfig.json", "--pretty", "false"])
+            .current_dir(&project)
+            .output()
+            .expect("run tsgo -b");
+        assert_eq!(
+            build.status.success(),
+            expect_success,
+            "tsgo -b in {}:\n{}",
+            root.display(),
+            String::from_utf8_lossy(&build.stdout)
+        );
+    }
+    let out = root.join("watch.txt");
+    let run = Command::new(env!("CARGO_BIN_EXE_goport_watch"))
+        .arg(&out)
+        .arg("tsconfig.base.json")
+        .arg("edits/tsconfig.base.json")
+        .args(["--", "-b", "--watch", "tsconfig.json", "--pretty", "false"])
+        .current_dir(&project)
+        .output()
+        .expect("run goport_watch");
+    assert!(
+        run.status.success(),
+        "goport_watch failed ({}) in {}:\n{}\n{}",
+        run.status,
+        root.display(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        normalize_watch_output(&read(&out)),
+        read(&project.join("expected.txt")),
+        "watch output against tsgo ({})",
+        root.display()
+    );
+    assert_eq!(
+        read(&project.join("app/dist/tsconfig.tsbuildinfo")),
+        read(&project.join("expected-app.tsbuildinfo.json")),
+        "app build info against tsgo ({})",
+        root.display()
+    );
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
 /// Runs `goport_watch` with `tsc_args` on a copy of the `watch-config`
 /// fixture through its edits, and checks the output against `expected` and
 /// the outputs against `expected-out`.
@@ -944,6 +1020,113 @@ fn build_includes_files_that_an_earlier_project_left_out() {
         assert!(build_info.is_file(), "no {}", build_info.display());
     }
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+/// A script that uses many `lib.es5.d.ts` and `lib.dom.d.ts` symbols and
+/// merges with two lib interfaces. Go N (`tsgo-oracle-673a5f17d713`) gives
+/// the two errors that the test checks.
+const SERIAL_BIND_SCRIPT: &str = r#"interface Array<T> { lastItem(): T | undefined; }
+interface Window { appName: string; }
+const div: HTMLDivElement = document.createElement("div");
+const tag: number = div.tagName;
+const doubled = [1, 2, 3].map((n) => n * 2).filter((n) => n > 2);
+const last = doubled.lastItem();
+const joined = ["a", "b"].join("-").toUpperCase().split("-");
+const parsed: { a: number } = JSON.parse('{"a": 1}');
+const keys = Object.keys(parsed).concat(Object.getOwnPropertyNames(Math));
+const when = new Date(Date.now()).toISOString();
+const found = /x+/g.exec("xxy");
+const failure = new RangeError("bad");
+const rounded = Math.round(Math.PI * Number.MAX_VALUE);
+const bound = Function.prototype.bind.call(parseInt, null, "10");
+window.addEventListener("click", (e) => e.clientX + window.appName.length);
+let wrong: string = rounded;
+"#;
+
+/// followups31 (R177 reviewer item 2): the remap path of apisym1c. A
+/// serial bind (`GOPORT_BIND_THREADS=1`) binds each file into the binder
+/// lineage. Its first file, `lib.es5.d.ts`, loads its lib bind snapshot into
+/// the new lineage arena, so the snapshot joins as a file arena and its ids
+/// move (`lib_snapshot::load`, `BoundFile::remap`). The types, symbols and
+/// diagnostics must equal those of the parallel bind (the default on more
+/// than one core), where each file binds into an arena of its own, and
+/// those of a serial live bind (`GOPORT_LIB_SNAPSHOT=0`).
+#[test]
+fn a_serial_bind_with_a_lib_snapshot_in_the_new_lineage_equals_the_parallel_bind() {
+    let dir = scratch_dir("serial-bind");
+    write(
+        &dir.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "lib": ["dom", "es5"], "types": [], "strict": true, "noEmit": true }, "files": ["a.ts"] }"#,
+    );
+    write(&dir.join("a.ts"), SERIAL_BIND_SCRIPT);
+    // (bind threads, GOPORT_LIB_SNAPSHOT): the serial bind traces its
+    // snapshot loads.
+    let sides = [
+        ("serial", "1", "trace"),
+        ("parallel", "4", "1"),
+        ("live", "1", "0"),
+    ];
+    let runs: Vec<(BTreeMap<String, String>, Report, String)> = sides
+        .iter()
+        .map(|&(side, threads, snapshot)| {
+            let env = [
+                ("GOPORT_BIND_THREADS", threads),
+                ("GOPORT_LIB_SNAPSHOT", snapshot),
+            ];
+            let out = dir.join(side);
+            let typesyms = Command::new(env!("CARGO_BIN_EXE_goport_typesyms"))
+                .args(["-p", "tsconfig.json", "-o"])
+                .arg(&out)
+                .envs(env)
+                .current_dir(&dir)
+                .output()
+                .expect("run goport_typesyms");
+            let stderr = String::from_utf8_lossy(&typesyms.stderr).into_owned();
+            assert!(
+                typesyms.status.success(),
+                "{side} goport_typesyms: {stderr}"
+            );
+            let check = Command::new(env!("CARGO_BIN_EXE_tsgo"))
+                .args(["-p", "tsconfig.json", "--listFiles", "--pretty", "false"])
+                .envs(env)
+                .current_dir(&dir)
+                .output()
+                .expect("run tsgo");
+            let check = Report {
+                stdout: String::from_utf8(check.stdout).expect("tsgo stdout is UTF-8"),
+                status: check.status.code().expect("tsgo exited with a code"),
+            };
+            (read_tree(&out), check, stderr)
+        })
+        .collect();
+    let (types, check, stderr) = &runs[0];
+    assert!(
+        stderr.contains("goport lib snapshot: lib.es5.d.ts loaded"),
+        "the serial bind loads the snapshot of its first file: {stderr}"
+    );
+    // `--listFiles` lists the files after the errors.
+    assert!(
+        check
+            .stdout
+            .lines()
+            .find(|line| !line.contains("): error TS"))
+            .is_some_and(|line| line.ends_with("/lib.es5.d.ts")),
+        "lib.es5.d.ts is the first file: {}",
+        check.stdout
+    );
+    assert_eq!(
+        error_lines(&check.stdout),
+        [
+            "a.ts(4,7): error TS2322: Type 'string' is not assignable to type 'number'.",
+            "a.ts(16,5): error TS2322: Type 'number' is not assignable to type 'string'.",
+        ]
+    );
+    assert_eq!(check.status, 2);
+    for (side, (other_types, other_check, _)) in sides.iter().zip(&runs).skip(1) {
+        assert_eq!(other_types, types, "{} types and symbols", side.0);
+        assert_eq!(other_check, check, "{} tsgo", side.0);
+    }
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The diagnostic lines of a tsc report.

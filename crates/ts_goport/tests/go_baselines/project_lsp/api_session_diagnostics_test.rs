@@ -202,8 +202,18 @@ child_test! {
         let h2 = api.symbol(s2, &x2, "h(");
         let s3 = api.edit(s2, &x3);
         let h3 = api.symbol(s3, &x3, "h(");
+        // The global errors of `noLib`, which B's checker adds when it is
+        // made.
+        let before = api.b_diagnostic_count(s2);
         assert_eq!(api.type_text(s2, &api.b, h2), H_TYPE);
         let stored = api.b_diagnostic_count(s2);
+        // B stores the diagnostic of version 2, so the count below shows
+        // that the equal one of version 3 is not stored again.
+        assert_eq!(
+            stored,
+            before + 1,
+            "B stores \"Cannot find name 'Missing'.\""
+        );
         let version = {
             let program = project_program(&snapshot_of(&api.session, s2), &api.a.0);
             let file = program.get_source_file(X_TS).expect("x.ts");

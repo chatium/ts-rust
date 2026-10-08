@@ -1701,9 +1701,10 @@ pub fn compiler_options_affect_semantic_diagnostics(
     new_options: Option<&CompilerOptions>,
 ) -> bool {
     // Effect-TS/tsgo patch 028: Effect plugin options affect Effect diagnostics.
-    if old_options.and_then(|o| o.effect.as_deref())
-        != new_options.and_then(|o| o.effect.as_deref())
-    {
+    // Without the rules (a standalone API process) they affect nothing, and
+    // its build info records none (`rulerunner::enabled_options`).
+    use crate::effect::rulerunner::enabled_options;
+    if old_options.and_then(enabled_options) != new_options.and_then(enabled_options) {
         return true;
     }
     options_have_changes(old_options, new_options, &|option| {

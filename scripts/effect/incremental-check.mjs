@@ -6,8 +6,12 @@
 //     clean run of the same compiler prints, and
 //   - a `--watch` session must report the same diagnostics.
 // With --ref, the reference compiler's clean run must match too.
+// With --plain (a compiler without Effect, such as the tsgo oracle), ours and
+// plain take turns on one .tsbuildinfo: plain must print what its clean run
+// prints (no "Unknown diagnostic message" panic on Effect build info), and
+// ours must still print what its clean run prints.
 //
-// usage: node scripts/effect/incremental-check.mjs --ours BIN [--ref BIN] --modules <node_modules with effect> [--work DIR]
+// usage: node scripts/effect/incremental-check.mjs --ours BIN [--ref BIN] [--plain BIN] --modules <node_modules with effect> [--work DIR]
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -18,6 +22,7 @@ const { values: args } = parseArgs({
   options: {
     ours: { type: "string" },
     ref: { type: "string" },
+    plain: { type: "string" },
     modules: { type: "string" },
     work: { type: "string", default: "/tmp/effect-incremental" },
   },
@@ -57,6 +62,7 @@ const steps = [
 const work = path.resolve(args.work);
 fs.rmSync(work, { recursive: true, force: true });
 const dirs = { inc: path.join(work, "incremental"), watch: path.join(work, "watch"), clean: path.join(work, "clean") };
+if (args.plain) dirs.mixed = path.join(work, "mixed");
 for (const dir of Object.values(dirs)) {
   fs.mkdirSync(path.join(dir, "node_modules"), { recursive: true });
   fs.symlinkSync(fs.realpathSync(path.join(args.modules, "effect")), path.join(dir, "node_modules/effect"));
@@ -65,9 +71,9 @@ for (const dir of Object.values(dirs)) {
 async function tsc(bin, cwd, extra = []) {
   try {
     const { stdout } = await run(bin, ["-p", "tsconfig.json", "--pretty", "false", ...extra], { cwd });
-    return { code: 0, out: stdout };
+    return { code: 0, out: stdout, err: "" };
   } catch (e) {
-    return { code: e.code, out: e.stdout ?? "" };
+    return { code: e.code, out: e.stdout ?? "", err: e.stderr ?? "" };
   }
 }
 const lines = (out) => out.split("\n").filter((l) => /\): (error|warning|suggestion|message) TS/.test(l)).sort().join("\n");
@@ -122,6 +128,16 @@ for (const step of steps) {
   if ((inc.code === 0) !== (clean.code === 0)) problems.push(`incremental exit ${inc.code}, clean ${clean.code}`);
   if (watched !== null && lines(watched) !== lines(clean.out)) problems.push(`watch differs from clean:\n${watched}\n--- clean\n${clean.out}`);
   if (ref && lines(ref.out) !== lines(clean.out)) problems.push(`reference differs:\n${ref.out}\n--- ours\n${clean.out}`);
+  if (args.plain) {
+    const shared = ["--incremental", "--tsBuildInfoFile", "mixed.tsbuildinfo"];
+    const mixedOurs = await tsc(args.ours, dirs.mixed, shared);
+    const mixedPlain = await tsc(args.plain, dirs.mixed, shared);
+    const plainClean = await tsc(args.plain, dirs.clean);
+    if (lines(mixedOurs.out) !== lines(clean.out) || (mixedOurs.code === 0) !== (clean.code === 0))
+      problems.push(`ours after plain differs from clean (exit ${mixedOurs.code}):\n${mixedOurs.out}${mixedOurs.err}`);
+    if (mixedPlain.out !== plainClean.out || mixedPlain.code !== plainClean.code || mixedPlain.err)
+      problems.push(`plain after ours differs from a clean plain run (exit ${mixedPlain.code}, clean ${plainClean.code}):\n${mixedPlain.out}${mixedPlain.err}`);
+  }
   const count = lines(clean.out).split("\n").filter(Boolean).length;
   if (problems.length) {
     failures++;

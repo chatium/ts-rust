@@ -183,6 +183,12 @@ impl CompilerHost for WatchCompilerHost {
         self.compiler_host.content_mapper_project()
     }
 
+    // PORT: not in Go (see `CompilerHost::prefetch_content_mapped`). The
+    // inner host takes the workers' transforms.
+    fn prefetch_content_mapped(&self) -> bool {
+        self.compiler_host.prefetch_content_mapped()
+    }
+
     fn get_resolved_project_reference(
         &self,
         file_name: &str,

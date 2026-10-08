@@ -41,10 +41,12 @@
 //! of its own. After the version dies, the next bind frees them
 //! (`program::Lineage`), and each program copy of the lineage lets go of
 //! them when its release frees its tables (M2c, `program::bound_symbols`).
-//! When the last holder lets go, the version is dead: its store and
-//! `GoFile` are freed, its id goes to `DEAD_FILES`, and each per-file
-//! thread-local map (`PerFileMap`) forgets the entries of that id when it
-//! is next written. A later read of its store, `GoFile` or node data panics
+//! When the last holder lets go, the version is dead: its id goes to
+//! `DEAD_FILES` and leaves the registry, its store and `GoFile` are freed
+//! (after it, on a free thread, when a pin release of the stdio API or
+//! `tsc -b -w` takes its data: `take_data`), and each per-file thread-local
+//! map (`PerFileMap`) forgets the entries of that id when it is next
+//! written. A later read of its store, `GoFile` or node data panics
 //! with "file version N is released": ids are never reused, so a missed
 //! holder panics there and never reads another file. A header or child
 //! read of its node shell reads its pooled block: the data of that node
@@ -59,9 +61,10 @@
 //! +10.2% (+6.7% to +9.7% on the default threads), and the editor long
 //! sessions query-core +9.6%, hono +4.5%, effect +9.3%. A correct reader
 //! never sees a reuse: every holder of a node holds its version, and a
-//! given-back block waits two pin releases (`BlockPool`). The
-//! debug-assertion runs (the protected tests, the corpus, the editor and
-//! oracle runs) find a missed holder.
+//! given-back block waits two pin releases (`BlockPool`). No standing run
+//! has debug assertions: the protected tests run `--release`
+//! (`build-goport-tests.sh`), and the corpus, editor and oracle runs use
+//! release bins. A debug test build checks each `file_block` read.
 //!
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
 //! a path that a publish on this thread published before, in a language
@@ -701,7 +704,7 @@ struct PinRelease;
 impl Drop for PinRelease {
     // Go has no counterpart: Go's GC frees the leased `*ast.SourceFile`
     // after api/session.go:1906 `lease.Release()` (handleReleaseSourceFile,
-    // :1893; project/snapshothost.go:45 `cache.Deref`). The free thread
+    // :1893; project/snapshothost.go:47 `cache.Deref`). The free thread
     // and the free at the thread's end are Rust-only.
     fn drop(&mut self) {
         let _ = PIN_RELEASE_QUEUED.try_with(|queued| queued.set(false));
@@ -723,24 +726,10 @@ impl Drop for PinRelease {
             let Ok(version) = Rc::try_unwrap(pin) else {
                 continue;
             };
-            // `try_unwrap` takes the strong count from 1 to 0 in one step,
-            // so after it a registry upgrade fails on every thread.
-            let mut version = match Arc::try_unwrap(version) {
-                Ok(version) => version,
-                // Another holder keeps the version (a guard or the tables
-                // of a program on another thread): the `Arc` drops as usual.
-                Err(version) => {
-                    drop(version);
-                    continue;
-                }
+            // The version dies here, before the send.
+            let Some((nodes, data)) = kill_and_take_data(version) else {
+                continue;
             };
-            // Before `take_data`, which takes the store that it reads.
-            let nodes = version.node_count();
-            let data = version.take_data();
-            // The version dies here, before the send: its `Drop` puts its
-            // id in `DEAD_FILES` and takes it out of the registry, so a read
-            // of it panics (`released`) from now on.
-            drop(version);
             if nodes >= min_nodes {
                 garbage.push(data);
             }
@@ -750,6 +739,41 @@ impl Drop for PinRelease {
             free_in_background(Box::new(garbage));
         }
     }
+}
+
+/// Not in Go (perf): when this is the last holder of `version`, the version
+/// dies here and gives its node count and its data (`take_data`), for a
+/// free on a free thread. `try_unwrap` takes the strong count from 1 to 0
+/// in one step, so after it a registry upgrade fails on every thread, and
+/// the version's `Drop` here puts its id in `DEAD_FILES` and takes it out
+/// of the registry before the caller sends the data: a read of it panics
+/// (`released`) from now on. `None` when another holder keeps the version
+/// (a guard, or the tables of a program on another thread): the `Arc`
+/// drops here as usual, and the version dies with its last holder.
+fn kill_and_take_data(version: Arc<FileVersion>) -> Option<(usize, impl Send + use<>)> {
+    let mut version = Arc::try_unwrap(version).ok()?;
+    // Before `take_data`, which takes the store that it reads.
+    let nodes = version.node_count();
+    let data = version.take_data();
+    drop(version);
+    Some((nodes, data))
+}
+
+/// Not in Go (perf, followups32): the data of each version of `versions`
+/// whose last holder this is, for a free on a free thread. Each such
+/// version dies here (`kill_and_take_data`), so its id is dead before the
+/// send, as in a pin release (`PinRelease`). `tsc -b -w` frees the kept
+/// parses that a config change drops this way
+/// (`BuildHost::drop_kept_parses_whose_module_indicator_options_change`),
+/// as Go's GC frees the files of the old program.
+pub(crate) fn take_data_of_dying_versions(
+    versions: Vec<Arc<FileVersion>>,
+) -> Vec<impl Send + use<>> {
+    versions
+        .into_iter()
+        .filter_map(kill_and_take_data)
+        .map(|(_, data)| data)
+        .collect()
 }
 
 /// Not in Go (perf, apiperf1): on this thread, the pin release of a source
@@ -1153,7 +1177,9 @@ impl<V> Deref for PerFileMap<V> {
 mod tests {
     use super::*;
 
-    /// A node of file `file`. No test publishes the ids used here.
+    /// The first node of file `file`. The tests with a fixed id (`DYING`,
+    /// `OTHER`) do not publish it; the others publish the file first
+    /// (`publish_pinned`).
     fn node(file: usize) -> Node {
         Node(((file as u64) << 32) | 1)
     }
@@ -1325,6 +1351,146 @@ mod tests {
             "the end of the thread frees the data, not the free thread"
         );
         go.send(()).expect("the free thread waits");
+    }
+
+    // followups32 (followups30 item 3 (a)): a version that dies in a pin
+    // release on a thread that frees in the background leaves the registry
+    // in the release (`FileVersion::drop`), before its data goes to the free
+    // thread, so a busy free thread leaves no entry of a dead version. It
+    // publishes, so no other test may build or publish stores while it runs
+    // (the runner uses one thread).
+    #[test]
+    fn a_pin_release_takes_a_dying_version_out_of_the_registry() {
+        std::thread::spawn(|| {
+            let (version, text) = publish_pinned("/fv/registry.ts", &["a"]);
+            let file = version.file();
+            drop(version);
+            assert!(lock(&VERSIONS).contains_key(&file), "a live version");
+            let go = block_free_thread();
+            FREE_IN_BACKGROUND.with(|min_nodes| min_nodes.set(Some(0)));
+            release_file_version_pins_later();
+            assert!(
+                !lock(&VERSIONS).contains_key(&file),
+                "the registry has no entry of the dead version"
+            );
+            assert!(
+                text.upgrade().is_some(),
+                "the data waits for the free thread"
+            );
+            go.send(()).expect("the free thread waits");
+            wait_for_free(&text);
+        })
+        .join()
+        .expect("the test thread ends");
+    }
+
+    // followups32 (followups30 item 3 (a)): a pin that a `FileRef` guard of
+    // this thread shares does not unwrap in a pin release (`Rc::try_unwrap`
+    // fails): the pin drops there, and the guard keeps the version, which
+    // stays live and in the registry. When the guard drops, the version
+    // dies there, and its data is freed with it, not on the free thread. It
+    // publishes, so no other test may build or publish stores while it runs
+    // (the runner uses one thread).
+    #[test]
+    fn a_pin_release_keeps_a_version_that_a_guard_shares() {
+        std::thread::spawn(|| {
+            let (version, text) = publish_pinned("/fv/guard.ts", &["a"]);
+            let file = version.file();
+            let probe = file_version_probe(node(file)).expect("a live version");
+            let guard = pinned_file_version(file).expect("the pin of this thread");
+            drop(version);
+            let go = block_free_thread();
+            FREE_IN_BACKGROUND.with(|min_nodes| min_nodes.set(Some(0)));
+            let dead = dead_file_versions();
+            release_file_version_pins_later();
+            assert!(!probe.is_freed(), "the guard keeps the version");
+            assert!(lock(&VERSIONS).contains_key(&file), "a live version");
+            assert!(dead_files_since(dead).0.is_empty(), "no version died");
+            assert_eq!(guard.file(), file);
+            drop(guard);
+            assert!(probe.is_freed(), "the version dies with the guard");
+            assert!(
+                text.upgrade().is_none(),
+                "the data is freed with the version, not on the free thread"
+            );
+            go.send(()).expect("the free thread waits");
+        })
+        .join()
+        .expect("the test thread ends");
+    }
+
+    /// Starts the build's free thread (`build_task::drop_in_background`)
+    /// when it has not started and blocks it, as `block_free_thread`.
+    fn block_build_free_thread() -> std::sync::mpsc::Sender<()> {
+        let (go, wait) = std::sync::mpsc::channel();
+        crate::execute::build::build_task::drop_in_background(Blocker(wait));
+        go
+    }
+
+    /// Waits up to 60 s for a free thread to free the data of `text`.
+    fn wait_for_free(text: &Weak<str>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while text.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the free thread frees the data"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    // followups32 item 6: `tsc -b -w` frees the kept parses that a config
+    // change drops with `take_data_of_dying_versions`
+    // (`BuildHost::drop_kept_parses_whose_module_indicator_options_change`):
+    // a version whose last holder that is dies there, before its data goes
+    // to the build's free thread, so its id is dead, it is not in the
+    // registry and a read of it panics while the free thread is busy. The
+    // free thread frees its data later. A version with another holder lives
+    // until that holder lets go. It publishes, so no other test may build or
+    // publish stores while it runs (the runner uses one thread).
+    #[test]
+    fn a_dropped_kept_parse_dies_before_its_data_goes_to_the_free_thread() {
+        std::thread::spawn(|| {
+            let (version, text) = publish_pinned("/fv/kept-parse.ts", &["a"]);
+            let (shared, shared_text) = publish_pinned("/fv/kept-shared.ts", &["a"]);
+            let file = version.file();
+            let probes = [file, shared.file()]
+                .map(|file| file_version_probe(node(file)).expect("a live version"));
+            // The pins of this thread go, so `version` is its last holder.
+            release_file_version_pins();
+            let go = block_build_free_thread();
+            let dead = dead_file_versions();
+            let data = take_data_of_dying_versions(vec![version, shared.clone()]);
+            assert_eq!(data.len(), 1, "only a version with no other holder dies");
+            crate::execute::build::build_task::drop_in_background(data);
+            assert!(probes[0].is_freed(), "the version dies before the send");
+            assert!(
+                !lock(&VERSIONS).contains_key(&file),
+                "the registry has no entry of the dead version"
+            );
+            assert_eq!(dead_files_since(dead).0, [file]);
+            let read = std::panic::catch_unwind(|| pinned_file_version(file).is_some());
+            let message = read.expect_err("a read of a dead version panics");
+            assert_eq!(
+                message.downcast_ref::<String>(),
+                Some(&format!("file version {file} is released"))
+            );
+            assert!(
+                text.upgrade().is_some(),
+                "the data waits for the free thread"
+            );
+            assert!(!probes[1].is_freed(), "its other holder keeps a version");
+            drop(shared);
+            assert!(probes[1].is_freed(), "the last holder frees the version");
+            assert!(
+                shared_text.upgrade().is_none(),
+                "the last holder frees the data"
+            );
+            go.send(()).expect("the free thread waits");
+            wait_for_free(&text);
+        })
+        .join()
+        .expect("the test thread ends");
     }
 
     // A node of a dead version whose id the map forgot gets no new id: the

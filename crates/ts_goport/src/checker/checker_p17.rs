@@ -949,12 +949,18 @@ impl Checker {
             // of the whole list copied two strings per pattern on each call,
             // so the list is read by index and only candidates are cloned.
             // `initialize_checker` sets the list before any check.
+            // PERF: the Go bytes of the module name are made once per call,
+            // not three times per pattern (midway tests every import that
+            // its paths do not resolve against many patterns).
+            let module_reference_bytes = go_string_bytes(module_reference);
             let mut candidates: Vec<PatternAmbientModule> = Vec::new();
             for i in 0..self.pattern_ambient_modules.len() {
                 let symbol = self.pattern_ambient_modules[i].symbol;
                 let module_attributes_type = self.get_type_of_module_import_attributes(symbol);
-                if core_p17::pattern_matches(&self.pattern_ambient_modules[i], module_reference)
-                    && self.is_type_assignable_to(import_attributes_type, module_attributes_type)
+                if core_p17::pattern_matches_go_bytes(
+                    &self.pattern_ambient_modules[i],
+                    &module_reference_bytes,
+                ) && self.is_type_assignable_to(import_attributes_type, module_attributes_type)
                 {
                     candidates.push(self.pattern_ambient_modules[i].clone());
                 }
@@ -2819,9 +2825,10 @@ mod core_p17 {
         let mut longest_match_prefix_length: isize = -1;
         // PORT: Go compares bytes. The texts are port forms, so this
         // compares their Go bytes (see `scanner_util::GO_STRING_MARKER`).
+        let candidate = go_string_bytes(candidate);
         for value in values {
             let star_index = go_len(&value.pattern_prefix) as isize;
-            let matches = pattern_matches(value, candidate);
+            let matches = pattern_matches_go_bytes(value, &candidate);
             if star_index > longest_match_prefix_length && matches {
                 best_pattern = Some(value);
                 longest_match_prefix_length = star_index;
@@ -2832,11 +2839,21 @@ mod core_p17 {
 
     // Go: core/pattern.go:22 Pattern.Matches
     // PORT: for `ast.PatternAmbientModule.Pattern`, which always has a star
-    // (see `find_best_pattern_match`).
-    pub fn pattern_matches(value: &PatternAmbientModule, candidate: &str) -> bool {
-        go_len(candidate) >= go_len(&value.pattern_prefix) + go_len(&value.pattern_suffix)
-            && go_has_prefix(candidate, &value.pattern_prefix)
-            && go_has_suffix(candidate, &value.pattern_suffix)
+    // (see `find_best_pattern_match`). `candidate` is the Go bytes of the
+    // candidate (`go_string_bytes`), so a caller that tests many patterns
+    // makes them once.
+    // PERF: a first or last byte that differs rejects the pattern before
+    // the `memcmp` call of `starts_with` or `ends_with`.
+    pub fn pattern_matches_go_bytes(value: &PatternAmbientModule, candidate: &[u8]) -> bool {
+        let prefix = go_string_bytes(&value.pattern_prefix);
+        let suffix = go_string_bytes(&value.pattern_suffix);
+        candidate.len() >= prefix.len() + suffix.len()
+            && prefix.first().is_none_or(|&b| candidate[0] == b)
+            && suffix
+                .last()
+                .is_none_or(|&b| candidate[candidate.len() - 1] == b)
+            && candidate.starts_with(&prefix)
+            && candidate.ends_with(&suffix)
     }
 }
 
@@ -2916,5 +2933,67 @@ mod module_p17 {
         } else {
             need_allow_arbitrary_extensions()
         }
+    }
+}
+
+#[cfg(test)]
+mod pattern_match_tests {
+    use super::core_p17::pattern_matches_go_bytes;
+    use crate::prelude::*;
+
+    /// `pattern_matches_go_bytes` gives Go `Pattern.Matches`
+    /// (core/pattern.go:22) on the Go bytes: `len(candidate) >= len(Text)-1`,
+    /// `strings.HasPrefix` and `strings.HasSuffix`. The texts include empty
+    /// affixes, affixes that overlap in a short candidate, and port forms
+    /// with invalid byte units, where a byte suffix can match inside a char.
+    #[test]
+    fn pattern_matches_as_go_on_go_bytes() {
+        let invalid = |bytes: &[u8]| go_string_from_bytes(bytes.to_vec());
+        let patterns = [
+            ("", ".svg"),
+            ("virtual:", ""),
+            ("ab", "ba"),
+            ("", ""),
+            ("", &invalid(&[0xA9])),
+            (&invalid(&[0xC3]), ""),
+            ("x", &invalid(&[0xFF, b'z'])),
+        ];
+        let candidates = [
+            "a.svg",
+            ".svg",
+            "svg",
+            "virtual:x",
+            "virtual",
+            "aba",
+            "abba",
+            "ab-ba",
+            "",
+            "é",
+            "xé",
+            &invalid(&[b'x', 0xFF, b'z']),
+            &invalid(&[0xC3]),
+        ];
+        let mut got = Vec::new();
+        let mut want = Vec::new();
+        for (prefix, suffix) in &patterns {
+            let value = PatternAmbientModule {
+                pattern_prefix: prefix.to_string(),
+                pattern_suffix: suffix.to_string(),
+                symbol: SymbolId::NIL,
+            };
+            for candidate in &candidates {
+                let (c, p, s) = (
+                    go_string_bytes(candidate),
+                    go_string_bytes(prefix),
+                    go_string_bytes(suffix),
+                );
+                want.push(c.len() >= p.len() + s.len() && c.starts_with(&p) && c.ends_with(&s));
+                got.push(pattern_matches_go_bytes(&value, &c));
+            }
+        }
+        assert_eq!(got, want);
+        // `é` (C3 A9) ends with the byte A9, as in Go.
+        assert!(got[4 * candidates.len() + 9]);
+        assert_eq!(got.iter().filter(|&&m| m).count(), 23);
     }
 }

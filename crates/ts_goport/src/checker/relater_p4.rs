@@ -13,6 +13,11 @@ use crate::prelude::*;
 // `r.borrow_mut()` calls that never live across another call, so re-entrant
 // use of the same relater is safe.
 
+/// `is_type_subset_of_union` keeps the answer for a union source when its
+/// searches make about this many comparisons or more. Shorter calls cost
+/// about as much as a lookup, and the table stays small.
+const UNION_SUBSET_MEMO_MIN: usize = 64;
+
 /// Go `r.relation == rel` (pointer equality of `*Relation`).
 fn relation_is(r: &Rc<RefCell<Relater>>, kind: RelationKind) -> bool {
     r.borrow().kind == kind
@@ -159,15 +164,37 @@ impl Checker {
     }
 
     // Go: checker/relater.go:2867 isTypeSubsetOfUnion
+    // PERF (unionsub1): not in Go. When the searches of a union source are
+    // long, the answer is kept in `union_subset_answers` and a repeat call
+    // returns it. eslint-plugin-svelte makes 10,724 calls on 1,039 distinct
+    // pairs, and the repeats made 16.2 M of the 19.7 M comparisons (sources
+    // of 43,000 types searched in unions of 55,844). A repeat has Go's
+    // answer and no effect: the member lists and the fields that
+    // `compare_types` reads do not change after a type is made, so Go's
+    // repeat makes the same comparisons with the same results, and the one
+    // effect of a comparison (a lazy symbol id) came with the first call.
+    // A long first call searches on entries (`contains_types_by_entries`).
     pub fn is_type_subset_of_union(&mut self, source: TypeId, target: TypeId) -> bool {
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
-            for i in 0..self.ty(source).types().len() {
-                let t = self.type_at(source, i);
-                if !self.contains_type(self.ty(target).types(), t) {
-                    return false;
-                }
+            let n = self.ty(source).types().len();
+            let m = self.ty(target).types().len();
+            // About the number of comparisons (n searches of log2(m) steps).
+            let work = n * (usize::BITS - m.leading_zeros()) as usize;
+            let keep = work >= UNION_SUBSET_MEMO_MIN;
+            if keep && let Some(&answer) = self.union_subset_answers.get(&(source, target)) {
+                return answer;
             }
-            return true;
+            let (sources, targets) = (self.ty(source).types(), self.ty(target).types());
+            // The entries cost about one comparison per type.
+            let answer = if work >= 4 * (n + m) {
+                self.contains_types_by_entries(targets, sources)
+            } else {
+                sources.iter().all(|&t| self.contains_type(targets, t))
+            };
+            if keep {
+                self.union_subset_answers.insert((source, target), answer);
+            }
+            return answer;
         }
         if self.ty(source).flags.intersects(TypeFlags::ENUM_LIKE)
             && self.get_base_type_of_enum_like_type(source) == target
@@ -847,18 +874,15 @@ impl Checker {
     }
 
     // Go: checker/relater.go:3212 getErrorState
-    // PORT: perf. `related_info` is almost always empty; `Vec::new()` then
-    // skips the out-of-line `Vec::clone` call.
+    // PERF: both fields are shared (`RelatedInfo`), so the state and each
+    // copy of it copy two pointers, as Go copies a chain pointer and a slice
+    // header. Before, each state copied and dropped a `Vec<Diagnostic>`.
     #[inline]
     pub fn get_error_state(&self, r: &Rc<RefCell<Relater>>) -> ErrorState {
         let rb = r.borrow();
         ErrorState {
             error_chain: rb.error_chain.clone(),
-            related_info: if rb.related_info.is_empty() {
-                Vec::new()
-            } else {
-                rb.related_info.clone()
-            },
+            related_info: rb.related_info.clone(),
         }
     }
 
@@ -2291,5 +2315,62 @@ impl Checker {
             }
         }
         Ternary::FALSE
+    }
+}
+
+#[cfg(test)]
+mod union_subset_tests {
+    use super::*;
+    use crate::checker::utilities_p1::union_sort_tests::with_alias_types;
+
+    /// `is_type_subset_of_union` gives Go's answer (each source member
+    /// searched in the target) on first and repeat calls, and keeps only
+    /// the answers of long searches.
+    #[test]
+    fn kept_subset_answers_are_go_answers() {
+        let literals = |r: std::ops::Range<usize>| {
+            r.map(|i| format!("\"a{i}\""))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let source = format!(
+            "type Big = {};\ntype Half = {};\ntype Other = {} | \"zz\";\ntype Few = \"a1\" | \"a2\";\n\
+             type Obj = {{ x: 1 }} | {{ y: 2 }} | {};\n",
+            literals(0..40),
+            literals(0..20),
+            literals(5..25),
+            literals(0..12),
+        );
+        with_alias_types(&source, |c, types| {
+            let unions: Vec<TypeId> = types
+                .iter()
+                .copied()
+                .filter(|&t| c.ty(t).flags.intersects(TypeFlags::UNION))
+                .collect();
+            let [big, half, other, few, obj] = unions[..] else {
+                panic!("{} unions", unions.len());
+            };
+            for round in 0..2 {
+                for &s in &unions {
+                    for &t in &unions {
+                        let targets = c.ty(t).types();
+                        let go = c
+                            .ty(s)
+                            .types()
+                            .iter()
+                            .all(|&m| c.search_union_types(targets, m).1);
+                        assert_eq!(c.is_type_subset_of_union(s, t), go, "round {round}");
+                    }
+                }
+            }
+            let kept = |s, t| c.union_subset_answers.get(&(s, t)).copied();
+            assert_eq!(kept(half, big), Some(true));
+            assert_eq!(kept(other, big), Some(false));
+            assert_eq!(kept(big, obj), Some(false));
+            assert_eq!(kept(obj, big), Some(false));
+            // 2 searches of 6 steps: not kept.
+            assert_eq!(kept(few, big), None);
+            assert!(c.is_type_subset_of_union(few, big));
+        });
     }
 }

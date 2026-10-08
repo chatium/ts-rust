@@ -684,6 +684,8 @@ pub struct AssertionLinks {
 pub struct SourceFileLinks {
     pub type_checked: bool,
     pub unused_checked: bool,
+    /// Effect-TS/tsgo: the Effect rules ran on this file (see `check_source_file`).
+    pub effect_checked: bool,
     pub external_helpers_module: SymbolId,
     pub requested_external_emit_helpers: ExternalEmitHelpers,
     pub deferred_nodes: IndexSet<Node>,
@@ -2486,6 +2488,9 @@ pub struct ConditionalRoot {
     // PORT: Go nil map is `None`.
     pub instantiations: Option<InstantiationMap>,
     pub alias: Option<Rc<TypeAlias>>,
+    // PERF: not in Go. The answer of `is_distribution_dependent` once its
+    // first walk ends (`None` before), so a repeat call does not walk again.
+    pub distribution_dependent: Option<bool>,
 }
 
 // Go: checker/types.go:1269 ConditionalType

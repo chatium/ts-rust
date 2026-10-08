@@ -93,12 +93,18 @@ pub struct FileLoader {
     pub content_mapper_failures: RefCell<FxHashMap<*const Mapper, i32>>,
     pub content_mapper_init_failed: RefCell<FxHashSet<*const Mapper>>,
     pub content_mapper_diagnostics: RefCell<Vec<Diagnostic>>,
-    /// What the parse workers transform the files of each mapper with
-    /// (`concurrent_content_mapper_transform`). Keyed as the maps above:
-    /// two mappers of one package and version have their own options, and
-    /// so their own project.
-    // PORT: not in Go (see `FilesParser::prefetch_request`).
-    pub concurrent_transforms: RefCell<FxHashMap<*const Mapper, Option<Arc<ConcurrentTransform>>>>,
+    /// What the parse workers send the transforms of each mapper's files
+    /// with, from the loader's first transform of a file of the mapper on
+    /// (`note_content_mapper_transform`). Keyed as the maps above: two
+    /// mappers of one package and version have their own options, and so
+    /// their own project.
+    // PORT: not in Go, where the parse goroutines transform.
+    pub concurrent_transforms: RefCell<FxHashMap<*const Mapper, Arc<ConcurrentTransform>>>,
+    /// Set when `concurrent_transforms` gets a mapper, so that the files
+    /// parser queues the worker jobs of the files of that mapper that wait
+    /// in its queue (`FilesParser::queue_mapped_prefetch`).
+    // PORT: not in Go (see `concurrent_transforms`).
+    pub mapped_prefetch_ready: Cell<bool>,
     // ts#64299. PORT: Go `moduleResolutionErrorOnce` plus the error is an
     // `Option` that keeps the first error.
     pub module_resolution_error: RefCell<Option<GoError>>,
@@ -272,6 +278,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         content_mapper_init_failed: RefCell::new(FxHashSet::default()),
         content_mapper_diagnostics: RefCell::new(Vec::new()),
         concurrent_transforms: RefCell::new(FxHashMap::default()),
+        mapped_prefetch_ready: Cell::new(false),
         module_resolution_error: RefCell::new(None),
         opts,
     };
@@ -302,10 +309,12 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         // `BuildStatCache`), no project reference faking host (only a
         // program that uses the sources of its references has one) and no
         // traced resolution (Go then skips the cache too). A worker resolves
-        // the output `.d.ts` file of a project reference with its redirect, as
-        // the loader does; the redirect is part of the cache key. A program
-        // with project references shares answers only in `tsc -b`. Only for
-        // the default resolver: a parse worker cannot run a
+        // the files of a project reference with its redirect, from the
+        // source file, as the loader does (Go `getRedirectForResolution`,
+        // `WorkerResolveConfig::redirects`); the redirect is part of the
+        // cache key, and the loader takes a file's answers only when the
+        // worker used its redirect and containing file (`FilePrep::fits`).
+        // Only for the default resolver: a parse worker cannot run a
         // `create_module_resolver` one.
         // PORT: with `skip_module_resolution` the loader resolves nothing
         // (ts#64024), so the workers do not either.
@@ -315,12 +324,6 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
             && !loader.opts.skip_module_resolution
             && loader.opts.host.is_plain_os_fs()
             && compiler_options.trace_resolution != Tristate::True
-            && (loader
-                .opts
-                .config
-                .resolved_project_reference_paths()
-                .is_empty()
-                || loader.opts.host.stat_cache().is_some())
             && !loader.opts.can_use_project_reference_source()
         {
             let shared = Arc::new(SharedResolutionCache::default());
@@ -458,6 +461,14 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         std::mem::forget(loader);
     }
     processed_files
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Each worker prep that the loads on this thread looked at: the file
+    /// name and whether the loader could use it (`FilePrep::fits`).
+    static PREP_FITS: std::cell::RefCell<Vec<(String, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -1111,8 +1122,11 @@ impl FileLoader {
     // subsequent files. Other failures produce per-file diagnostics and count toward a failure budget; after
     // maxContentMapperFailures, one program diagnostic reports that the mapper was disabled and subsequent
     // files are silently substituted with empty files. It returns nil only if the file cannot be read.
-    // PORT: the host transforms on this (the loading) thread; the content
-    // mapper host is dispatch-thread state (`contentmapper` module docs).
+    // PORT: the content mapper host is dispatch-thread state
+    // (`contentmapper` module docs), so the host transforms on this (the
+    // loading) thread. Once that opened the mapper project, the parse
+    // workers send the transforms of the later files, and the host takes
+    // their results (`note_content_mapper_transform`).
     pub fn parse_content_mapped_file(
         &self,
         opts: SourceFileParseOptions,
@@ -1134,11 +1148,12 @@ impl FileLoader {
                 &transform_identity,
             )));
         }
-        match self
+        let files = self
             .opts
             .host
-            .get_content_mapped_source_files(&opts, &mapper)
-        {
+            .get_content_mapped_source_files(&opts, &mapper);
+        self.note_content_mapper_transform(&mapper);
+        match files {
             Ok(files) => files.canonical,
             Err(err) => {
                 let mut source_file =
@@ -1221,19 +1236,17 @@ impl FileLoader {
         source_file
     }
 
-    // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
-    // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
-    /// What a parse worker can transform the content-mapped file
-    /// `file_name` with, cached per mapper. `None` keeps the file's
-    /// transform on this thread: the mapper failed, its host has no
-    /// concurrent transform, or `GOPORT_MAPPED_PREFETCH` is `0` (an A/B
-    /// switch).
+    /// What a parse worker sends the transform of the content-mapped file
+    /// `file_name` with (`FilesParser::prefetch_request`): `None` until
+    /// the loader's transform of a file of its mapper opened the mapper
+    /// project, and after the mapper is disabled.
     // PORT: not in Go, where the parse goroutines transform (tsgo#4712).
     pub(crate) fn concurrent_content_mapper_transform(
         &self,
         file_name: &str,
     ) -> Option<Arc<ConcurrentTransform>> {
-        if std::env::var_os("GOPORT_MAPPED_PREFETCH").is_some_and(|value| value == "0") {
+        let transforms = self.concurrent_transforms.borrow();
+        if transforms.is_empty() {
             return None;
         }
         let mapper = self
@@ -1243,21 +1256,48 @@ impl FileLoader {
         if self.content_mapper_unavailable(Some(&mapper)) {
             return None;
         }
-        let key = Rc::as_ptr(&mapper);
-        if let Some(transform) = self.concurrent_transforms.borrow().get(&key) {
-            return transform.clone();
+        transforms.get(&Rc::as_ptr(&mapper)).cloned()
+    }
+
+    /// After the loader's transform of a file of `mapper`: when the host
+    /// lets the parse workers transform (`prefetch_content_mapped`) and the
+    /// transform opened the mapper project, keeps what the workers send
+    /// the later transforms with. Go opens the project on the first
+    /// transform too, so no request goes out that Go does not send.
+    /// `GOPORT_MAPPED_PREFETCH=0` turns it off (an A/B switch).
+    // PORT: not in Go (see `concurrent_transforms`).
+    fn note_content_mapper_transform(&self, mapper: &Rc<Mapper>) {
+        let key = Rc::as_ptr(mapper);
+        if self.concurrent_transforms.borrow().contains_key(&key)
+            || !self.opts.host.prefetch_content_mapped()
+            || std::env::var_os("GOPORT_MAPPED_PREFETCH").is_some_and(|value| value == "0")
+        {
+            return;
         }
-        let transform = self
+        let Some(transform) = self
             .opts
             .host
             .content_mapper_project()
-            .and_then(|project| project.concurrent_transform(&mapper));
+            .and_then(|project| project.concurrent_transform(mapper))
+        else {
+            return;
+        };
         self.concurrent_transforms
             .borrow_mut()
-            .insert(key, transform.clone());
-        transform
+            .insert(key, transform);
+        self.mapped_prefetch_ready.set(true);
     }
 
+    /// Stops the worker transforms of a mapper that the loader disabled.
+    // PORT: not in Go (see `concurrent_transforms`).
+    fn disable_concurrent_transform(&self, mapper: &Rc<Mapper>) {
+        if let Some(transform) = self.concurrent_transforms.borrow().get(&Rc::as_ptr(mapper)) {
+            transform.disable();
+        }
+    }
+
+    // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
+    // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
     fn content_mapper_unavailable(&self, mapper: Option<&Rc<Mapper>>) -> bool {
         let Some(mapper) = mapper else {
             return false;
@@ -1290,6 +1330,7 @@ impl FileLoader {
         self.content_mapper_diagnostics
             .borrow_mut()
             .push(content_mapper_initialization_diagnostic(label, err));
+        self.disable_concurrent_transform(mapper);
     }
 
     // Go: fileloader.go:660 (*fileLoader).recordContentMapperFailure (tsgo#4712)
@@ -1310,6 +1351,8 @@ impl FileLoader {
                     diag::The_content_mapper_0_failed_1_times_and_will_not_be_used,
                     args![label, MAX_CONTENT_MAPPER_FAILURES],
                 ));
+            drop(failures);
+            self.disable_concurrent_transform(mapper);
         }
         true
     }
@@ -1665,6 +1708,11 @@ impl FileLoader {
                     if !usable {
                         count_prep(|c| c.preps_unfit += 1);
                     }
+                    #[cfg(test)]
+                    PREP_FITS.with(|fits| {
+                        fits.borrow_mut()
+                            .push((file.file_name().to_string(), usable));
+                    });
                     usable
                 });
             let (mut names_taken, mut names_own) = (0, 0);
@@ -2504,6 +2552,7 @@ mod tests {
     use super::super::files_parser::{preps_taken, set_load_prep, set_meta_wait};
     use super::*;
     use crate::frontend::bundled;
+    use crate::frontend::module::cache::set_answer_wait;
     use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
     use crate::frontend::vfs::osvfs_fs;
 
@@ -2578,12 +2627,23 @@ mod tests {
 
     /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir,
     /// loads the program with parse workers (not single threaded), and
-    /// returns what the load found, as text: the files in program order,
-    /// the metadata, module and type reference resolutions (in map order)
-    /// and include reasons of each file, the synthetic imports, the
-    /// processing diagnostics, the missing files and the package.json
-    /// entries of the resolver.
+    /// returns what the load found (`load_text`).
     fn parallel_load(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> String {
+        load_text(label, tsconfig, files, false)
+    }
+
+    /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir,
+    /// loads the program, and returns what the load found, as text: the
+    /// files in program order, the metadata, module and type reference
+    /// resolutions (in map order) and include reasons of each file, the
+    /// synthetic imports, the processing diagnostics, the missing files
+    /// and the package.json entries of the resolver.
+    fn load_text(
+        label: &str,
+        tsconfig: &str,
+        files: &[(&str, &str)],
+        single_threaded: bool,
+    ) -> String {
         use std::fmt::Write as _;
         let dir = std::env::temp_dir().join(format!(
             "ts_goport_file_loader_{label}_{}",
@@ -2597,6 +2657,9 @@ mod tests {
         }
         std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
         let cwd = dir.to_string_lossy().replace('\\', "/");
+        // Taken while the dir exists: the real path of a removed dir is the
+        // path itself.
+        let real = osvfs_fs().realpath(&cwd);
         let fs = bundled::wrap_fs(osvfs_fs());
         let sys = System {
             fs: fs.clone(),
@@ -2616,20 +2679,36 @@ mod tests {
                 host,
                 config: Rc::new(config.unwrap()),
                 use_source_of_project_reference: false,
-                single_threaded: Tristate::False,
+                single_threaded: if single_threaded {
+                    Tristate::True
+                } else {
+                    Tristate::False
+                },
                 typings_location: String::new(),
                 project_name: String::new(),
                 create_module_resolver: None,
                 skip_module_resolution: false,
             },
-            false,
+            single_threaded,
         );
         let _ = std::fs::remove_dir_all(&dir);
         let mut out = String::new();
         // The include reasons name files by path (Go `tspath.Path`), which
         // is in lower case on a case-insensitive file system (macOS).
-        let cwd_path = to_path(&cwd, "", osvfs_fs().use_case_sensitive_file_names()).0;
-        let name = |file_name: &str| file_name.replace(&cwd, "<dir>").replace(&cwd_path, "<dir>");
+        let case_sensitive = osvfs_fs().use_case_sensitive_file_names();
+        let cwd_path = to_path(&cwd, "", case_sensitive).0;
+        // A node_modules file is named by its real path (Go
+        // `resolutionState.realPath`, module/resolver.go:1859). On macOS the
+        // temp dir is under /var, a symlink to /private/var, and the real
+        // path contains the plain one, so it is replaced first.
+        let real_path = to_path(&real, "", case_sensitive).0;
+        let name = |file_name: &str| {
+            file_name
+                .replace(&real, "<dir>")
+                .replace(&real_path, "<dir>")
+                .replace(&cwd, "<dir>")
+                .replace(&cwd_path, "<dir>")
+        };
         for file in &processed.files {
             let path = file.path();
             writeln!(out, "file {}", name(file.file_name())).unwrap();
@@ -2829,6 +2908,121 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         }
     }
 
+    /// A program with a project reference (`lib`) that it loads by the
+    /// output `.d.ts` files (Go `getParseFileRedirect`, a program that does
+    /// not use the sources of its references). The names in `lib/out` and
+    /// in `lib/src/types.d.ts` (a source with no output) resolve with the
+    /// options of `lib/tsconfig.json`, from their source files (Go
+    /// `getRedirectForResolution`): its `paths` find `@lib/helper`, and its
+    /// custom condition finds `dep/lib.d.ts`. `src/a.ts` resolves `dep`
+    /// with the root options, to `dep/index.d.ts`.
+    const REFERENCE_TSCONFIG: &str = r#"{ "compilerOptions": { "module": "esnext",
+         "moduleResolution": "bundler", "types": [], "noEmit": true },
+         "include": ["src"], "references": [{ "path": "./lib" }] }"#;
+    const REFERENCE_FILES: [(&str, &str); 10] = [
+        (
+            "lib/tsconfig.json",
+            r#"{ "compilerOptions": { "composite": true, "module": "esnext",
+                 "moduleResolution": "bundler", "types": [], "rootDir": "src",
+                 "outDir": "out", "paths": { "@lib/*": ["./src/*"] },
+                 "customConditions": ["lib"] }, "include": ["src"] }"#,
+        ),
+        (
+            "lib/src/index.ts",
+            "export { h } from \"@lib/helper\";\nexport const x = 1;\n",
+        ),
+        ("lib/src/helper.ts", "export const h = 2;\n"),
+        (
+            "lib/src/types.d.ts",
+            "import type { Dep } from \"dep\";\nimport type { h } from \"@lib/helper\";\nexport type T = Dep | typeof h;\n",
+        ),
+        (
+            "lib/out/index.d.ts",
+            "export { h } from \"@lib/helper\";\nexport declare const x = 1;\n",
+        ),
+        (
+            "lib/out/helper.d.ts",
+            "import type { Dep } from \"dep\";\nexport declare const h: Dep;\n",
+        ),
+        (
+            "node_modules/dep/package.json",
+            r#"{ "name": "dep", "version": "1.0.0",
+               "exports": { ".": { "lib": "./lib.d.ts", "types": "./index.d.ts" } } }"#,
+        ),
+        ("node_modules/dep/lib.d.ts", "export type Dep = \"lib\";\n"),
+        (
+            "node_modules/dep/index.d.ts",
+            "export type Dep = \"root\";\n",
+        ),
+        (
+            "src/a.ts",
+            r#"import { x, h } from "../lib/src/index";
+import type { T } from "../lib/src/types";
+import type { Dep } from "dep";
+export const a: T | Dep | number = x + (h as never);
+"#,
+        ),
+    ];
+
+    // loadcrit2: with project references, the parse workers resolve each
+    // file of a reference with the reference's options, from its source
+    // file, as the loader does (Go `getRedirectForResolution`,
+    // fileloader.go:842): the output `.d.ts` files and a `.d.ts` source.
+    // The loader takes their preps (`FilePrep::fits`), and the load finds
+    // what a load that resolves every name itself finds, and what a single
+    // threaded load finds.
+    #[test]
+    fn workers_resolve_with_the_reference_redirect_of_the_loader() {
+        let load = |label: &str, prep: bool, single_threaded: bool| {
+            set_load_prep(Some(prep));
+            set_meta_wait(prep && !single_threaded);
+            let text = load_text(label, REFERENCE_TSCONFIG, &REFERENCE_FILES, single_threaded);
+            set_load_prep(None);
+            set_meta_wait(false);
+            text
+        };
+        let single = load("refs_st", false, true);
+        assert_eq!(load("refs_prep_off", false, false), single);
+        for name in [
+            "lib/out/index.d.ts",
+            "lib/out/helper.d.ts",
+            "lib/src/types.d.ts",
+        ] {
+            assert!(single.contains(&format!("file <dir>/{name}")), "{single}");
+        }
+        for target in ["dep/lib.d.ts", "dep/index.d.ts"] {
+            assert!(
+                single.contains(&format!("-> <dir>/node_modules/{target} ")),
+                "{single}"
+            );
+        }
+        // A worker publishes its prep after the parse that the loader
+        // waits for, so the loader may resolve a file itself before it.
+        // Each redirected file's prep fits in some load, and no prep is
+        // unfit.
+        let redirected = [
+            "/lib/out/index.d.ts",
+            "/lib/out/helper.d.ts",
+            "/lib/src/types.d.ts",
+        ];
+        let mut fitted = [false; 3];
+        for run in 0..20 {
+            PREP_FITS.with(|fits| fits.borrow_mut().clear());
+            assert_eq!(load(&format!("refs_prep_on_{run}"), true, false), single);
+            let fits = PREP_FITS.with(|fits| std::mem::take(&mut *fits.borrow_mut()));
+            assert!(fits.iter().all(|(_, fit)| *fit), "unfit preps: {fits:?}");
+            for (index, name) in redirected.iter().enumerate() {
+                fitted[index] |= fits.iter().any(|(file, _)| file.ends_with(name));
+            }
+            if !super::super::files_parser::parse_workers_enabled() || fitted.iter().all(|f| *f) {
+                break;
+            }
+        }
+        if super::super::files_parser::parse_workers_enabled() {
+            assert_eq!(fitted, [true; 3], "{redirected:?}");
+        }
+    }
+
     /// Loads a one-file project with `compilerOptions` and returns the base
     /// names of the lib files in the program.
     fn lib_file_names(label: &str, compiler_options: &str) -> Vec<String> {
@@ -2923,6 +3117,18 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         tsconfig: &str,
         files: &[(&str, &str)],
     ) -> (ProcessedFiles, std::path::PathBuf, String) {
+        load_with_workers_on(label, tsconfig, files, bundled::wrap_fs(osvfs_fs()))
+    }
+
+    /// `load_with_workers` with `fs` as the loader's file system: the OS
+    /// file system, maybe wrapped (`wrapvfs`). The parse workers read the
+    /// OS file system (`run_prefetch_worker`).
+    fn load_with_workers_on(
+        label: &str,
+        tsconfig: &str,
+        files: &[(&str, &str)],
+        fs: Rc<dyn Fs>,
+    ) -> (ProcessedFiles, std::path::PathBuf, String) {
         let dir = std::env::temp_dir().join(format!(
             "ts_goport_file_loader_{label}_{}",
             std::process::id()
@@ -2935,9 +3141,8 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         }
         std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
         let cwd = dir.to_string_lossy().replace('\\', "/");
-        let fs = bundled::wrap_fs(osvfs_fs());
         let sys = System {
-            fs: fs.clone(),
+            fs: bundled::wrap_fs(osvfs_fs()),
             current_directory: cwd.clone(),
         };
         let (config, errors) = get_parsed_command_line_of_config_file(
@@ -2948,7 +3153,14 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
             None,
         );
         assert!(errors.is_empty());
-        let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None, None);
+        // The parse workers run when the host shows the plain OS file
+        // system (`CompilerHost::is_plain_os_fs`): `fs` reads it.
+        let host = super::super::host::new_compiler_host_over(
+            &cwd,
+            crate::frontend::vfs::cachedvfs_from(fs),
+            &bundled::wrap_fs(osvfs_fs()),
+            &bundled::lib_path(),
+        );
         let processed = process_all_program_files(
             ProgramOptions {
                 host,
@@ -3045,6 +3257,79 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         set_meta_wait(false);
     }
 
+    // followups32: when the loader takes a file's metadata from its parse
+    // worker, it keeps the package.json reads of the worker's package scope
+    // walk in the program resolver's cache (`Caches::adopt_worker_package_jsons`),
+    // so its own lookups later in the load find them and do not read the
+    // files again, as the Go loader finds the metadata with the program's
+    // resolver (fileloader.go:391, module/resolver.go:1755
+    // getPackageJsonInfo, packagejson/cache.go:190 Set). No worker resolves
+    // the module augmentation "aug" (the workers resolve imports), so the
+    // loader resolves it while it loads `src/a.ts`, after it took that
+    // file's metadata, and its self-name lookup (module/resolver.go:576
+    // loadModuleFromSelfNameReference) asks for the package scope of `src`,
+    // which the worker's walk read. The loader waits for the worker's
+    // metadata (`set_meta_wait`), so this holds whatever the timing. Without
+    // the take-time adoption the loader reads the project's package.json
+    // itself, and the end of the load does not change that.
+    #[test]
+    fn the_loader_reads_no_package_json_that_a_taken_metadata_walk_read() {
+        if !super::super::files_parser::parse_workers_enabled() {
+            return;
+        }
+        let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
+             "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "module" }"#),
+            (
+                "src/a.ts",
+                "export const a = 1;\ndeclare module \"aug\" {}\n",
+            ),
+        ];
+        // The package.json files that the loader reads.
+        let reads = Rc::new(RefCell::new(Vec::<String>::new()));
+        let os = bundled::wrap_fs(osvfs_fs());
+        let read_file = {
+            let (os, reads) = (os.clone(), reads.clone());
+            move |path: &str| {
+                if path.ends_with("/package.json") {
+                    reads.borrow_mut().push(path.to_string());
+                }
+                os.read_file(path)
+            }
+        };
+        let fs = crate::frontend::vfs::wrapvfs_wrap(
+            os,
+            crate::frontend::vfs::Replacements {
+                read_file: Some(Box::new(read_file)),
+                ..Default::default()
+            },
+        );
+        set_load_prep(Some(true));
+        set_meta_wait(true);
+        let before = crate::frontend::module::cache::adopted_package_jsons();
+        let (processed, dir, cwd) =
+            load_with_workers_on("no_package_json_reads", tsconfig, &files, fs);
+        let adopted = crate::frontend::module::cache::adopted_package_jsons() - before;
+        set_load_prep(None);
+        set_meta_wait(false);
+        let _ = std::fs::remove_dir_all(&dir);
+        let resolver = processed
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+            .expect("the default resolver");
+        let cache = &resolver.caches.package_json_info_cache;
+        assert!(adopted > 0, "no worker package.json taken");
+        // A lookup of the load asked for the entry (a read that no lookup
+        // asks for stays a pending read, which `contains_key` does not see).
+        assert!(
+            cache.contains_key(&cache.key(&format!("{cwd}/package.json"))),
+            "the loader did not look up the package scope of src"
+        );
+        assert_eq!(*reads.borrow(), Vec::<String>::new());
+    }
+
     // A parse worker that panics after it starts a job ends the job
     // (`RunningJob`), so the loader that waits for it finds the metadata and
     // parses the file itself, and the load ends with the file. The loader
@@ -3090,6 +3375,60 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         assert_eq!(loaded, Some(ModuleKind::ES_NEXT), "{a}");
     }
 
+    // loadcrit2: the job of an output `.d.ts` file of a project reference,
+    // which a worker parses in place of its source (`PrefetchQueue::redirects`)
+    // and resolves with the reference's redirect. When its worker panics
+    // after it starts the job, the loader that waits for it still loads the
+    // file and resolves its names with the redirect. Without the wake the
+    // test fails after 60 s. The panic ends its worker, and the loader also
+    // waits for the jobs that no worker has started (`set_meta_wait`), so
+    // the test needs a second worker to run them: with one
+    // (`GOPORT_PARSE_THREADS=1`, two CPUs) it does not run.
+    #[test]
+    fn a_worker_panic_in_a_redirected_job_leaves_no_loader_waiting() {
+        use super::super::files_parser::{
+            PANIC_IN_JOB, parse_workers_enabled, prefetch_worker_count,
+        };
+        if !parse_workers_enabled() || prefetch_worker_count() < 2 {
+            return;
+        }
+        let label = "worker_panic_redirect";
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_file_loader_{label}_{}",
+            std::process::id()
+        ));
+        let output = format!(
+            "{}/lib/out/helper.d.ts",
+            dir.to_string_lossy().replace('\\', "/")
+        );
+        *PANIC_IN_JOB.lock().unwrap() = Some(output.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            set_load_prep(Some(true));
+            set_meta_wait(true);
+            let (processed, dir, _) =
+                load_with_workers(label, REFERENCE_TSCONFIG, &REFERENCE_FILES);
+            let _ = std::fs::remove_dir_all(&dir);
+            let dep = processed
+                .files
+                .iter()
+                .find(|file| file.file_name().ends_with("/lib/out/helper.d.ts"))
+                .and_then(|file| processed.resolved_modules.get(file.path()))
+                .and_then(|resolutions| {
+                    resolutions
+                        .iter()
+                        .find(|(key, _)| key.name == "dep")
+                        .map(|(_, resolved)| get_base_file_name(&resolved.resolved_file_name))
+                });
+            let _ = sender.send(dep);
+        });
+        let loaded = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        *PANIC_IN_JOB.lock().unwrap() = None;
+        let loaded =
+            loaded.expect("the loader still waits for the job of the worker that panicked");
+        assert_eq!(loaded, Some("lib.d.ts".to_string()), "{output}");
+    }
+
     // lazypj1: the parse workers also read package.json files for the
     // module answers that the loader takes. At the end of the load those
     // reads go into the program resolver's cache, which parses one only
@@ -3100,7 +3439,10 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
     // `lib` is in no file's package scope (its types are under `sub`, which
     // has its own package.json), so only the answer for "lib" reads it. A
     // lookup on the loading thread after the load finds what the load
-    // read, also when the file changed on disk since.
+    // read, also when the file changed on disk since. With the prep on, the
+    // loader waits for the worker's metadata (`set_meta_wait`) and answer
+    // (`set_answer_wait`), so it takes the answer for "lib" and does not
+    // read the file, whatever the timing.
     #[test]
     fn the_loader_keeps_the_package_json_files_of_worker_module_answers() {
         let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
@@ -3121,8 +3463,12 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 "export declare const x: number;\n",
             ),
         ];
+        // With no parse workers the loader reads every file itself.
+        let workers = super::super::files_parser::parse_workers_enabled();
         for prep in [true, false] {
             set_load_prep(Some(prep));
+            set_meta_wait(prep && workers);
+            set_answer_wait(prep && workers);
             let (processed, dir, cwd) = load_with_workers(
                 &format!("keeps_answer_package_jsons_{prep}"),
                 tsconfig,
@@ -3148,10 +3494,441 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 .map(|contents| contents.fields.header_fields.name.get_value().0);
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(name, Some("lib".to_string()), "prep {prep}");
-            if prep && super::super::files_parser::parse_workers_enabled() {
+            if prep && workers {
                 assert!(!loader_read, "the loader read the package.json of lib");
             }
         }
         set_load_prep(None);
+        set_meta_wait(false);
+        set_answer_wait(false);
+    }
+
+    /// A fake content mapper process over a socket pair (Go `net.Pipe` in
+    /// the Go host tests). It answers `initialize` and `openProject` at
+    /// once, and the transform requests newest first on another thread, so
+    /// the answers come out of order when requests overlap. The text of a
+    /// mapped file is TypeScript: `@diag` adds a mapper diagnostic, `@fail`
+    /// answers with an error, `@supp` adds a supplemental output. After
+    /// `exit_after` transform requests it closes the connection (a mapper
+    /// crash). `transforms` gets the file name of each transform request.
+    mod fake_mapper {
+        use crate::contentmapper::{
+            Diagnostic, InitializeResult, MappedOutput, OpenProjectResult, PositionEncoding,
+            ProcessExitState, SupplementalOutput, TransformParams, TransformResult,
+        };
+        use crate::frontend::json::json_unmarshal;
+        use crate::frontend::json_ext::{AnyValue, JsonValue};
+        use crate::gostd::GoError;
+        use crate::ipc::{self, Message, Protocol as _, ReadWriteCloser};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        struct End(UnixStream);
+
+        impl ReadWriteCloser for End {
+            fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+                (&self.0).read(buf)
+            }
+
+            fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+                (&self.0).write(buf)
+            }
+
+            fn flush(&self) -> std::io::Result<()> {
+                (&self.0).flush()
+            }
+
+            fn close(&self) -> Result<(), GoError> {
+                let _ = self.0.shutdown(std::net::Shutdown::Both);
+                Ok(())
+            }
+        }
+
+        impl ProcessExitState for End {}
+
+        type Queue = Arc<(Mutex<(Vec<Message>, bool)>, Condvar)>;
+
+        pub(super) fn spawn(
+            transforms: Arc<Mutex<Vec<String>>>,
+            exit_after: Option<usize>,
+        ) -> Arc<dyn ProcessExitState> {
+            let (client, server) = UnixStream::pair().expect("socket pair");
+            let server: Arc<dyn ReadWriteCloser> = Arc::new(End(server));
+            let write = Arc::new(Mutex::new(()));
+            let queue: Queue = Arc::default();
+            let answer = {
+                let (server, write) = (server.clone(), write.clone());
+                move |msg: &Message, result: Option<Box<dyn AnyValue>>| {
+                    let _write = write.lock().unwrap();
+                    let _ = ipc::new_jsonrpc_protocol(server.clone())
+                        .write_response(msg.id.as_ref(), result);
+                }
+            };
+            {
+                let (server, write, queue) = (server.clone(), write.clone(), queue.clone());
+                std::thread::spawn(move || {
+                    loop {
+                        let msg = {
+                            let (lock, ready) = &*queue;
+                            let mut queue = lock.lock().unwrap();
+                            loop {
+                                if let Some(msg) = queue.0.pop() {
+                                    break msg;
+                                }
+                                if queue.1 {
+                                    return;
+                                }
+                                queue = ready.wait(queue).unwrap();
+                            }
+                        };
+                        let mut params = TransformParams::default();
+                        json_unmarshal(&msg.params.0, &mut params, &[]).unwrap();
+                        let _write = write.lock().unwrap();
+                        let mut protocol = ipc::new_jsonrpc_protocol(server.clone());
+                        if params.content.contains("@fail") {
+                            let _ = protocol.write_error(
+                                msg.id.as_ref(),
+                                &crate::jsonrpc::ResponseError {
+                                    code: crate::jsonrpc::CODE_INTERNAL_ERROR,
+                                    message: "fake failure".to_string(),
+                                    data: None,
+                                },
+                            );
+                            continue;
+                        }
+                        let _ = protocol.write_response(msg.id.as_ref(), Some(transform(&params)));
+                    }
+                });
+            }
+            std::thread::spawn(move || {
+                let mut protocol = ipc::new_jsonrpc_protocol(server.clone());
+                let mut count = 0;
+                while let Ok(msg) = protocol.read_message() {
+                    match msg.method.as_str() {
+                        "initialize" => answer(
+                            &msg,
+                            Some(Box::new(InitializeResult {
+                                position_encoding: PositionEncoding::UTF8,
+                                diagnostic_source: "fake".to_string(),
+                            })),
+                        ),
+                        "openProject" => {
+                            answer(&msg, Some(Box::new(OpenProjectResult::default())));
+                        }
+                        "closeProject" => answer(&msg, None),
+                        "transform" => {
+                            count += 1;
+                            if exit_after.is_some_and(|limit| count > limit) {
+                                let _ = server.close();
+                                break;
+                            }
+                            let mut params = TransformParams::default();
+                            json_unmarshal(&msg.params.0, &mut params, &[]).unwrap();
+                            transforms.lock().unwrap().push(params.file_name);
+                            let (lock, ready) = &*queue;
+                            lock.lock().unwrap().0.push(msg);
+                            ready.notify_one();
+                        }
+                        _ => {}
+                    }
+                }
+                let (lock, ready) = &*queue;
+                lock.lock().unwrap().1 = true;
+                ready.notify_one();
+            });
+            Arc::new(End(client))
+        }
+
+        fn verbatim(text: &str, extension: &str) -> MappedOutput {
+            let length = text.len() as i32;
+            let mappings = crate::spanmap::new(&[crate::spanmap::Segment {
+                virtual_end: length,
+                original_end: length,
+                kind: crate::spanmap::Kind::VERBATIM,
+                ..Default::default()
+            }])
+            .marshal()
+            .unwrap();
+            MappedOutput {
+                text: text.to_string(),
+                extension: extension.to_string(),
+                mappings: JsonValue(mappings),
+                diagnostic_directives: None,
+            }
+        }
+
+        fn transform(params: &TransformParams) -> Box<dyn AnyValue> {
+            let mut result = TransformResult {
+                mapped_output: verbatim(&params.content, ".ts"),
+                ..Default::default()
+            };
+            if params.content.contains("@diag") {
+                result.diagnostics.push(Diagnostic {
+                    message_text: "fake diagnostic".to_string(),
+                    start: 0,
+                    length: 1,
+                    code: 9001,
+                });
+            }
+            if params.content.contains("@supp") {
+                result.supplemental.push(SupplementalOutput {
+                    mapped_output: MappedOutput {
+                        text: "export const supplemental = 1;\n".to_string(),
+                        extension: ".ts".to_string(),
+                        mappings: JsonValue(b"[]".to_vec()),
+                        diagnostic_directives: None,
+                    },
+                });
+            }
+            Box::new(result)
+        }
+    }
+
+    /// Loads a program of `files` in a temp dir with the fake mapper for
+    /// `.vue` files. Returns each program file (name, text and parse
+    /// diagnostics) and the content mapper diagnostics, one per line, the
+    /// file name of each transform request, and the spawns.
+    fn load_mapped(
+        label: &str,
+        tsconfig: &str,
+        files: &[(String, String)],
+        single_threaded: bool,
+        exit_after: Option<usize>,
+    ) -> (Vec<String>, Vec<String>, usize) {
+        use crate::contentmapper::{self, HostOptions, ProjectSpec, SpawnerFunc};
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_file_loader_{label}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mapper_package = (
+            "node_modules/fake-mapper/package.json".to_string(),
+            r#"{ "name": "fake-mapper", "version": "1.0.0",
+                 "typescript": { "contentMapper": { "exec": ["fake"] } } }"#
+                .to_string(),
+        );
+        for (path, text) in files.iter().chain([&mapper_package]) {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let fs = bundled::wrap_fs(osvfs_fs());
+        let sys = System {
+            fs: fs.clone(),
+            current_directory: cwd.clone(),
+        };
+        // Go `tsc --runExternalCode`.
+        let options = CompilerOptions {
+            run_external_code: Tristate::True,
+            ..Default::default()
+        };
+        let (config, errors) = get_parsed_command_line_of_config_file(
+            &format!("{cwd}/tsconfig.json"),
+            Some(&options),
+            None,
+            &sys,
+            None,
+        );
+        assert!(errors.is_empty());
+        let config = Rc::new(config.unwrap());
+        assert_eq!(config.content_mappers().len(), 1);
+        let transforms = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawns = Rc::new(Cell::new(0));
+        let spawner = {
+            let (transforms, spawns) = (transforms.clone(), spawns.clone());
+            SpawnerFunc(Box::new(move |_, _, _| {
+                spawns.set(spawns.get() + 1);
+                Ok(fake_mapper::spawn(transforms.clone(), exit_after))
+            }))
+        };
+        let ctx = crate::gostd::context::background();
+        let host = contentmapper::new_host_with_options(
+            &ctx,
+            Rc::new(spawner),
+            crate::locale::DEFAULT,
+            HostOptions { logger: None },
+        );
+        let project = host.project(ProjectSpec {
+            config_file_name: config.config_name().to_string(),
+            mappers: config.content_mappers().to_vec(),
+            compiler_options: Some(config.compiler_options().clone()),
+        });
+        let compiler_host = new_cached_fs_compiler_host(
+            &cwd,
+            fs,
+            &bundled::lib_path(),
+            None,
+            None,
+            project.clone(),
+        );
+        let processed = process_all_program_files(
+            ProgramOptions {
+                host: compiler_host,
+                config,
+                use_source_of_project_reference: false,
+                single_threaded: if single_threaded {
+                    Tristate::True
+                } else {
+                    Tristate::False
+                },
+                typings_location: String::new(),
+                project_name: String::new(),
+                create_module_resolver: None,
+                skip_module_resolution: false,
+            },
+            single_threaded,
+        );
+        if let Some(project) = project {
+            let _ = project.close();
+        }
+        let _ = host.close();
+        let _ = std::fs::remove_dir_all(&dir);
+        let diagnostic = |d: &Diagnostic| {
+            format!(
+                "{:?}",
+                (
+                    d.pos,
+                    d.end,
+                    d.code,
+                    &d.source,
+                    &d.message_text,
+                    &d.message_args
+                )
+            )
+        };
+        let mut lines: Vec<String> = processed
+            .files
+            .iter()
+            .filter(|file| file.file_name().starts_with(&cwd))
+            .map(|file| {
+                let name = file.file_name().replace(&cwd, "");
+                let diagnostics: Vec<String> = file.diagnostics.iter().map(diagnostic).collect();
+                format!("{name} {:?} {diagnostics:?}", file.text())
+            })
+            .collect();
+        lines.extend(processed.content_mapper_diagnostics.iter().map(diagnostic));
+        let transforms = std::mem::take(&mut *transforms.lock().unwrap());
+        let transforms = transforms
+            .into_iter()
+            .map(|name| name.replace(&cwd, ""))
+            .collect();
+        (lines, transforms, spawns.get())
+    }
+
+    const MAPPED_TSCONFIG: &str = r#"{ "compilerOptions": { "module": "preserve",
+         "moduleResolution": "bundler", "types": [], "noEmit": true },
+         "include": ["src"],
+         "contentMappers": [{ "package": "fake-mapper", "extensions": [".vue"] }] }"#;
+
+    /// `count` mapped files that import the next one, with `marker` in
+    /// file `i` when `marker(i)` names one.
+    fn mapped_files(count: usize, marker: fn(usize) -> &'static str) -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = (0..count)
+            .map(|i| {
+                let next = (i + 1) % count;
+                (
+                    format!("src/C{i}.vue"),
+                    format!(
+                        "// {}\nimport {{ v{next} }} from \"./C{next}.vue\";\nexport const v{i} = v{next};\n",
+                        marker(i)
+                    ),
+                )
+            })
+            .collect();
+        files.push((
+            "src/main.ts".to_string(),
+            "import { v0 } from \"./C0.vue\";\nexport const main = v0;\n".to_string(),
+        ));
+        files
+    }
+
+    // cmpar1: once the loader's transform of the first mapped file opened
+    // the mapper project, the parse workers send the transforms of the
+    // other mapped files and parse the virtual texts, and the loader takes
+    // their results. Each file gets one transform request, also with a
+    // mapper diagnostic, an error response or a supplemental output, and
+    // the program equals a load on one thread. The fake mapper answers the
+    // newest request first, so answers come out of order when requests
+    // overlap. Go sends the transforms from its parse goroutines
+    // (fileloader.go:438 parseContentMappedFile).
+    #[test]
+    fn workers_send_the_content_mapper_transforms() {
+        use super::super::files_parser::{MAPPED_TAKEN, parse_workers_enabled};
+        let files = mapped_files(40, |i| match i {
+            3 | 17 | 31 => "@diag",
+            9 | 26 => "@fail",
+            12 | 35 => "@supp",
+            _ => "",
+        });
+        let (serial, serial_transforms, _) =
+            load_mapped("mapped_serial", MAPPED_TSCONFIG, &files, true, None);
+        let taken = MAPPED_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+        let (parallel, mut parallel_transforms, _) =
+            load_mapped("mapped_parallel", MAPPED_TSCONFIG, &files, false, None);
+        let taken = MAPPED_TAKEN.load(std::sync::atomic::Ordering::Relaxed) - taken;
+        assert_eq!(serial_transforms.len(), 40);
+        parallel_transforms.sort();
+        parallel_transforms.dedup();
+        assert_eq!(parallel_transforms.len(), 40, "a file got two transforms");
+        assert_eq!(parallel.join("\n"), serial.join("\n"));
+        if parse_workers_enabled() {
+            assert!(taken > 0, "the loader took no worker transform");
+        }
+    }
+
+    // A mapper that crashes during the load: the calls in flight and all
+    // later calls fail, the first 5 failures in load order are reported,
+    // then the mapper is disabled, and the load ends.
+    #[test]
+    fn a_mapper_crash_during_worker_transforms_ends_the_load() {
+        let files = mapped_files(40, |_| "");
+        for single_threaded in [true, false] {
+            let (lines, _, _) = load_mapped(
+                &format!("mapped_crash_{single_threaded}"),
+                MAPPED_TSCONFIG,
+                &files,
+                single_threaded,
+                Some(10),
+            );
+            let count = |code: u32| {
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&format!(", {code}, ")))
+                    .count()
+            };
+            let failed = diag::The_content_mapper_0_failed_to_transform_this_file.code();
+            let disabled = diag::The_content_mapper_0_failed_1_times_and_will_not_be_used.code();
+            assert_eq!(
+                (count(failed), count(disabled)),
+                (5, 1),
+                "single threaded {single_threaded}:\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+
+    // A mapped file that the program names but that does not exist sends
+    // no request: the mapper does not start, so the project does not open
+    // and reports no option diagnostics (Go program.go:828 reports them
+    // only for opened projects).
+    #[test]
+    fn a_missing_mapped_file_starts_no_mapper() {
+        let tsconfig = r#"{ "compilerOptions": { "types": [], "noEmit": true },
+             "files": ["missing.vue", "a.ts"],
+             "contentMappers": [{ "package": "fake-mapper", "extensions": [".vue"] }] }"#;
+        let files = [("a.ts".to_string(), "export const a = 1;\n".to_string())];
+        for single_threaded in [true, false] {
+            let (_, transforms, spawns) = load_mapped(
+                &format!("mapped_missing_{single_threaded}"),
+                tsconfig,
+                &files,
+                single_threaded,
+                None,
+            );
+            assert_eq!((transforms.len(), spawns), (0, 0));
+        }
     }
 }

@@ -150,6 +150,7 @@ impl Checker {
         if self.flow_analysis_disabled {
             return self.error_type;
         }
+        let explicit_flow_node = flow_node.is_some();
         let mut flow_node = flow_node;
         if flow_node.is_nil() {
             flow_node = get_flow_node_of_node(reference);
@@ -157,25 +158,32 @@ impl Checker {
                 return declared_type;
             }
         }
-        let f = self.get_flow_state();
+        self.flow_invocation_count += 1;
+        // flowskip1: a walk that can only return the declared type and
+        // makes nothing is skipped (flow_skip.rs). P1: no explicit flow node.
+        // P3: declared == initial, not auto (go-model.md 2.4).
+        let evolved_type = if self.flow_skip.mode != FlowSkipMode::Off
+            && !explicit_flow_node
+            && (initial_type.is_nil() || initial_type == declared_type)
+            && declared_type != self.auto_type
+            && declared_type != self.auto_array_type
+            && let Some(nest) =
+                self.flow_skip_test(reference, declared_type, flow_container, flow_node)
         {
-            let mut fb = f.borrow_mut();
-            fb.reference = reference;
-            fb.reference_is_access = is_access_expression(reference);
-            fb.declared_type = declared_type;
-            fb.initial_type = if initial_type.is_some() {
-                initial_type
+            if self.flow_skip.mode == FlowSkipMode::Verify {
+                self.flow_skip_verify(reference, declared_type, flow_container, flow_node, nest)
             } else {
                 declared_type
-            };
-            fb.flow_container = flow_container;
-            fb.shared_flow_start = self.shared_flows.len() as i32;
-        }
-        self.flow_invocation_count += 1;
-        let evolved_type = self.get_type_at_flow_node(&f, flow_node).t;
-        let shared_flow_start = f.borrow().shared_flow_start as usize;
-        self.shared_flows.truncate(shared_flow_start);
-        self.put_flow_state(f);
+            }
+        } else {
+            self.flow_walk(
+                reference,
+                declared_type,
+                initial_type,
+                flow_container,
+                flow_node,
+            )
+        };
         // When the reference is 'x' in an 'x.length', 'x.push(value)', 'x.unshift(value)' or x[n] = value' operation,
         // we give type 'any[]' to 'x' instead of using the type determined by control flow analysis such that operations
         // on empty arrays are possible without implicit any errors and new element types can be inferred without
@@ -203,6 +211,38 @@ impl Checker {
             return declared_type;
         }
         result_type
+    }
+
+    /// The walk of `get_flow_type_of_reference_ex` (flow.go:87-99 without
+    /// the count): a flow state, `getTypeAtFlowNode`, and the release of
+    /// the state and of the shared flow entries of the walk.
+    pub(crate) fn flow_walk(
+        &mut self,
+        reference: Node,
+        declared_type: TypeId,
+        initial_type: TypeId,
+        flow_container: Node,
+        flow_node: FlowNodeId,
+    ) -> TypeId {
+        let f = self.get_flow_state();
+        {
+            let mut fb = f.borrow_mut();
+            fb.reference = reference;
+            fb.reference_is_access = is_access_expression(reference);
+            fb.declared_type = declared_type;
+            fb.initial_type = if initial_type.is_some() {
+                initial_type
+            } else {
+                declared_type
+            };
+            fb.flow_container = flow_container;
+            fb.shared_flow_start = self.shared_flows.len() as i32;
+        }
+        let evolved_type = self.get_type_at_flow_node(&f, flow_node).t;
+        let shared_flow_start = f.borrow().shared_flow_start as usize;
+        self.shared_flows.truncate(shared_flow_start);
+        self.put_flow_state(f);
+        evolved_type
     }
 
     // Go: checker/flow.go:117 getTypeAtFlowNode
@@ -237,7 +277,14 @@ impl Checker {
         // lsshells M3 repair: one guard for the whole walk, so the steps in
         // one freeable file version share one pin (`get_flow_in`).
         let mut flow_data_guard = None;
+        // flowskip1 verify mode: record each loop turn (read once per call;
+        // a nested verify restores the recording before it returns).
+        let recording = self.flow_skip.recording.is_some();
         loop {
+            if recording {
+                let depth = f.borrow().depth;
+                self.flow_skip_record(flow, depth);
+            }
             let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {

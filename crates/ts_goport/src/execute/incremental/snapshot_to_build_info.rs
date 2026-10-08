@@ -31,11 +31,14 @@ pub fn snapshot_to_build_info(
     let content_mapper_project =
         crate::program::go_frontend_program().and_then(|program| program.content_mapper_project());
     let content_mapper_identities = content_mapper_identities(content_mapper_project.as_deref())?;
+    // A standalone API process without the Effect rules writes plain build
+    // info (`rulerunner::enabled_options`).
+    let effect = crate::effect::rulerunner::enabled_options(snapshot.options);
     let build_info = BuildInfo {
-        version: version().to_string(),
+        version: build_info_version(effect.is_some()).into_owned(),
         content_mapper_identities,
         // Effect-TS/tsgo patch 028.
-        effect: snapshot.options.effect.as_ref().map(|e| e.to_value()),
+        effect: effect.map(crate::effect::etscore::EffectPluginOptions::to_value),
         ..BuildInfo::default()
     };
     let mut to = ToBuildInfo {

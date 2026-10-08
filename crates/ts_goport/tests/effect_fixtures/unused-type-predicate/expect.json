@@ -1,0 +1,10 @@
+{
+  "fails": true,
+  "has": [
+    "src/index.ts(1,26): error TS6133: 'value' is declared but its value is never read.",
+    "src/index.ts(3,26): error TS6133: 'input' is declared but its value is never read."
+  ],
+  "lacks": [],
+  "ref": { "fails": false, "has": [], "lacks": ["TS6133"] },
+  "refNote": "effect-tsgo (patch 002) runs the Effect rules before the unused check, and effectInFailure marks the predicate parameter referenced, so TS6133 is lost. tsgo with no plugin reports both lines."
+}

@@ -37,6 +37,44 @@ pub fn min_visible_severity(effect_config: Option<&EffectPluginOptions>) -> Seve
     Severity::Message
 }
 
+// PORT: not in Effect-TS/tsgo, whose checkers run the rules in every mode,
+// so its API answers carry Effect diagnostics. A standalone API process
+// (`tsgo --api`) answers here as plain tsgo: no Effect rules and no Effect
+// diagnostics (state note effectapi1-2026-10-07). An API session inside a
+// language server shares the server's checkers, so it keeps the rules.
+static API_RULES_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this process as a standalone API process, where the Effect rules
+/// and the plugin option check are off unless `TSGO_EFFECT_API=1` (read
+/// once). `api::new_standalone_session` calls it.
+pub fn set_api_process() {
+    static EFFECT_API: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("TSGO_EFFECT_API").is_some_and(|v| v == "1"));
+    API_RULES_OFF.store(!*EFFECT_API, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test hook: undoes `set_api_process`, so this process runs the rules as
+/// tsc does.
+#[doc(hidden)]
+pub fn clear_api_process() {
+    API_RULES_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The Effect plugin options of `options` when this process runs the rules:
+/// none in a standalone API process without `TSGO_EFFECT_API=1`
+/// (`set_api_process`). The checker, the plugin option check and build info
+/// (its version suffix and `effect` options, written and checked) all read
+/// this. A standalone API build then writes and expects plain build info,
+/// so a later tsc build checks the project again and reports the Effect
+/// diagnostics.
+#[must_use]
+pub fn enabled_options(options: &CompilerOptions) -> Option<&EffectPluginOptions> {
+    options
+        .effect
+        .as_deref()
+        .filter(|_| !API_RULES_OFF.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 // Go: rulerunner.Run
 /// The Effect diagnostics of `sf`. `rule_names` None runs every rule.
 pub fn run(

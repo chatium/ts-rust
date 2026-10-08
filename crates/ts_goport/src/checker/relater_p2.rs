@@ -337,7 +337,7 @@ impl Checker {
         let mut result: Vec<SymbolId> = Vec::new();
         for &source_property in source_properties {
             let name = self.sym(source_property).name.clone();
-            if self.is_discriminant_property(target, &name) {
+            if self.is_discriminant_property_key(target, TableKey::Name(&name)) {
                 result.push(source_property);
             }
         }
@@ -346,8 +346,15 @@ impl Checker {
 
     // Go: checker/relater.go:1080 isDiscriminantProperty
     pub fn is_discriminant_property(&mut self, t: TypeId, name: &str) -> bool {
+        self.is_discriminant_property_key(t, TableKey::Text(name))
+    }
+
+    /// `is_discriminant_property` by `TableKey`.
+    // PERF: a caller that holds the `Name` passes it, so the union property
+    // lookups in each constituent compare name ids, not texts.
+    pub fn is_discriminant_property_key(&mut self, t: TypeId, name: TableKey<'_>) -> bool {
         if t.is_some() && self.ty(t).flags.intersects(TypeFlags::UNION) {
-            let prop = self.get_union_or_intersection_property(
+            let prop = self.get_union_or_intersection_property_key(
                 t, name, false, /*skipObjectFunctionPropertyAugment*/
             );
             if prop.is_some()

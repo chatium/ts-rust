@@ -1735,11 +1735,25 @@ impl<T: Clone + Default> CowChunks<T> {
         // The last even chunk with indexes below the lineage length.
         let last = ((from.len - 1) >> COW_CHUNK_SHIFT) & !1;
         if last >= self.chunks.len() {
-            let own = std::mem::take(&mut self.tail);
+            let mut own = std::mem::take(&mut self.tail);
             self.chunks.push(match own.len() {
                 0 => Chunk::Freed,
                 COW_CHUNK_LEN => full_chunk(own),
-                _ => Chunk::Shared(Arc::new(own)),
+                // The tail has room for a whole chunk (`make_room`), and no
+                // value goes in this chunk again: keep only its values.
+                // PERF (followups31): the shrink copies the values (1 to 255)
+                // to an allocation of their size. On the apisym1c catch-up
+                // traces (alvin, THP off for the server, 20 runs per side,
+                // alternating, medians) it lowered peak RSS from 87.8 to
+                // 86.1 MiB on k3-memloop-60 and from 76.1 to 75.7 MiB on
+                // k3-memloop-10. m-kl-loop-10 and m-kl-loop-50 stayed at
+                // 182.2 and 194.8 MiB. Server CPU and wall time did not
+                // change (each p > 0.29). A first reading on zbook showed a
+                // rise of 2 to 4%, inside zbook's noise.
+                _ => {
+                    own.shrink_to_fit();
+                    Chunk::Shared(Arc::new(own))
+                }
             });
             self.chunks.resize_with(last + 1, || Chunk::Freed);
             self.len = self.tail_start();
@@ -2080,6 +2094,35 @@ mod hole_tests {
         let read = |index: usize| std::panic::catch_unwind(|| *checker.get(index)).is_err();
         assert!(read(version[0]));
         assert_eq!(*checker.get(own[299]), 10_299);
+    }
+
+    // followups31 (R177 reviewer item 4): when a catch-up passes the own
+    // tail, the tail becomes a shared chunk with its values only, not the
+    // room of a whole chunk that it had for later values.
+    #[test]
+    fn a_catch_up_past_the_own_tail_keeps_only_its_values() {
+        let mut lineage = CowChunks::new_interleaved();
+        push_indexes(&mut lineage, 10);
+        let mut checker = lineage.for_checker();
+        let seen = lineage.len();
+        let own: Vec<usize> = (0..44)
+            .map(|n| {
+                checker.push(10_000 + n);
+                checker.len() - 1
+            })
+            .collect();
+        let own_chunk = own[0] >> COW_CHUNK_SHIFT;
+        assert_eq!(checker.tail.capacity(), COW_CHUNK_LEN, "room for a chunk");
+        let later = push_indexes(&mut lineage, 3 * COW_CHUNK_LEN);
+        checker.catch_up(seen, &lineage);
+        match &checker.chunks[own_chunk] {
+            Chunk::Shared(values) => assert_eq!((values.len(), values.capacity()), (44, 44)),
+            _ => panic!("the own tail is a shared chunk"),
+        }
+        for (n, &index) in own.iter().enumerate() {
+            assert_eq!(*checker.get(index), 10_000 + n, "own {index}");
+        }
+        assert!(later.iter().all(|&index| *checker.get(index) == index));
     }
 
     // apisym1c: a checker arena makes its own symbols and tables in the odd
@@ -2568,7 +2611,12 @@ impl SymbolIds {
     }
 
     /// The place of own symbol index `index` among the own symbols: its
-    /// index without the lineage chunks, from `own_base` on.
+    /// index without the even chunks, from chunk pair `own_base` on. The
+    /// places are dense until the first catch-up that passes the own tail
+    /// (`CowChunks::catch_up`): the next own symbol then starts after the
+    /// lineage, so each odd chunk that the lineage passed is a gap of
+    /// `COW_CHUNK_LEN` places, 2 KiB in the own id table once a later own
+    /// symbol has an id (`ast::utilities_p1::OwnSymbolIds`).
     #[inline]
     fn own_place(&self, index: u32) -> u32 {
         (((index >> (COW_CHUNK_SHIFT + 1)) - self.own_base) << COW_CHUNK_SHIFT)

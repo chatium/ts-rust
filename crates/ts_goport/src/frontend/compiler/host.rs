@@ -89,6 +89,19 @@ pub trait CompilerHost {
         true
     }
 
+    /// True when the parse workers of a program load with this host send
+    /// the transform requests of the content-mapped files ahead of the
+    /// loader, once the loader's first transform opened the mapper project
+    /// (`FileLoader::concurrent_content_mapper_transform`). Then
+    /// `get_content_mapped_source_files` takes what they made
+    /// (`content_mapped_source_files`). The language server's project host
+    /// returns false: its parse cache makes each transform, of the editor
+    /// text.
+    // PORT: not in Go, where the parse goroutines send the transforms.
+    fn prefetch_content_mapped(&self) -> bool {
+        false
+    }
+
     /// The files that `get_source_file` gives now from the host's own
     /// cache, with no read and no parse, by name, with their references.
     /// The parse workers of a program load do not parse these files; they
@@ -124,6 +137,36 @@ pub trait CompilerHost {
     // port keeps each program shell (multiprog M2), and the shell keeps its
     // host, so the host lets go of its data instead.
     fn release(&self) {}
+}
+
+/// The body of Go `GetContentMappedSourceFiles` of the compiler host
+/// (host.go:100) and of the `tsc -b` project host (build/compilerHost.go:41),
+/// with the transform that a parse worker sent for the file
+/// (`take_prefetched_mapped`) in place of the host's own request.
+// PORT: the worker part is not in Go (see
+// `CompilerHost::prefetch_content_mapped`).
+pub(crate) fn content_mapped_source_files(
+    fs: &dyn Fs,
+    project: &dyn Project,
+    parse_options: &SourceFileParseOptions,
+    mapper: &Rc<Mapper>,
+) -> Result<SourceFiles, GoError> {
+    let (content, ok) = fs.read_file(&parse_options.file_name);
+    if !ok {
+        return Ok(SourceFiles::default());
+    }
+    let prefetched = take_prefetched_mapped(parse_options, &content);
+    let files = contentmapper::transform_and_parse_prefetched(
+        parse_options,
+        &content,
+        mapper,
+        project,
+        prefetched,
+    )?;
+    contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
+        fs.file_exists(name)
+    })?;
+    Ok(files)
 }
 
 /// Go trace callback `func(msg *diagnostics.Message, args ...any)`.
@@ -313,31 +356,12 @@ impl CompilerHost for CompilerHostImpl {
         let Some(project) = &self.content_mapper_project else {
             return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
         };
-        let (content, ok) = CompilerHost::fs(self).read_file(&parse_options.file_name);
-        if !ok {
-            return Ok(SourceFiles::default());
-        }
-        // PORT: not in Go: the transform and parse that a parse worker made
-        // ahead (`take_prefetched_mapped`).
-        if let Some((file, mapped)) = take_prefetched_mapped(parse_options, &content) {
-            return contentmapper::adopt_prefetched_parse(
-                parse_options,
-                &content,
-                mapper,
-                &**project,
-                file,
-                &mapped.virtual_extension,
-                mapped.mappings,
-                mapped.diagnostic_directives,
-            );
-        }
-        let files =
-            contentmapper::transform_and_parse(parse_options, &content, mapper, &**project)?;
-        let fs = CompilerHost::fs(self);
-        contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
-            fs.file_exists(name)
-        })?;
-        Ok(files)
+        content_mapped_source_files(&*CompilerHost::fs(self), &**project, parse_options, mapper)
+    }
+
+    // PORT: not in Go (see `CompilerHost::prefetch_content_mapped`).
+    fn prefetch_content_mapped(&self) -> bool {
+        true
     }
 
     // Go: host.go:115 (*compilerHost).ContentMapperProject (tsgo#4712)

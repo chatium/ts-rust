@@ -1212,13 +1212,30 @@ impl InfoCache {
 
     // Go: cache.go:190 Set
     // PORT: Go `LoadOrStore`: the first stored entry wins and is returned.
+    // A pending read of the key (`add_pending`) is a parse worker's read
+    // from earlier in the load, which Go's shared cache stored first, so it
+    // becomes the entry and `info` is dropped. The one caller
+    // (`get_package_json_info`, module/resolver.go:1755) calls `get` first,
+    // which takes the pending read, and adds no pending read between its
+    // `get` and `set`, so it never meets one here.
     pub fn set(&self, package_json_path: &str, info: Rc<InfoCacheEntry>) -> Rc<InfoCacheEntry> {
         let key = to_path(
             package_json_path,
             &self.current_directory,
             self.use_case_sensitive_file_names,
         );
-        self.cache.borrow_mut().entry(key).or_insert(info).clone()
+        let pending = if self.pending.borrow().is_empty() {
+            None
+        } else {
+            self.pending.borrow_mut().remove(&key)
+        };
+        let mut cache = self.cache.borrow_mut();
+        let entry = cache.entry(key);
+        match pending {
+            Some(pending) => entry.or_insert_with(|| pending.into_entry()),
+            None => entry.or_insert(info),
+        }
+        .clone()
     }
 
     // Go: cache.go:196 Range
@@ -1246,5 +1263,70 @@ impl InfoCache {
         let pending = std::mem::take(&mut *self.pending.borrow_mut());
         drop(entries);
         drop(pending);
+    }
+}
+
+#[cfg(test)]
+mod info_cache_tests {
+    use super::*;
+
+    /// A parse worker's read of the package.json `{ "name": name }` in
+    /// `/p/<dir>` (`InfoCache::add_pending`).
+    fn read(dir: &str, name: &str) -> PendingInfo {
+        PendingInfo {
+            package_directory: format!("/p/{dir}"),
+            directory_exists: true,
+            text: Some(format!(r#"{{ "name": "{name}" }}"#).into()),
+        }
+    }
+
+    /// The `name` field of the package.json of `entry`.
+    fn name(entry: &InfoCacheEntry) -> Option<String> {
+        let contents = entry.contents.as_ref()?;
+        Some(contents.fields.header_fields.name.get_value().0)
+    }
+
+    // followups32: Go `InfoCache.Set` (packagejson/cache.go:190
+    // `LoadOrStore`) keeps the first stored entry, and Go's parse tasks
+    // store their reads in that one cache. A pending read is a parse
+    // worker's read from earlier in the load, so a later `set` of its key
+    // gets the worker's entry and drops its own, and the pending read goes.
+    // With no pending read, `set` stores its entry, and a later pending
+    // read of the key is not kept. A `get` takes a pending read first.
+    #[test]
+    fn set_keeps_a_pending_read_as_the_first_entry() {
+        let cache = new_info_cache("/p", true);
+        cache.add_pending("/p/a/package.json", read("a", "a-worker"));
+        let stored = cache.set("/p/a/package.json", read("a", "a-set").into_entry());
+        assert_eq!(name(&stored).as_deref(), Some("a-worker"));
+        let got = cache.get("/p/a/package.json").expect("the entry of a");
+        assert!(Rc::ptr_eq(&got, &stored), "set stores the pending read");
+        assert!(
+            cache.pending.borrow().is_empty(),
+            "set takes the pending read"
+        );
+
+        let stored = cache.set("/p/b/package.json", read("b", "b-set").into_entry());
+        assert_eq!(name(&stored).as_deref(), Some("b-set"));
+        cache.add_pending("/p/b/package.json", read("b", "b-worker"));
+        assert!(
+            cache.pending.borrow().is_empty(),
+            "the entry of b came first"
+        );
+        let got = cache.get("/p/b/package.json").expect("the entry of b");
+        assert_eq!(name(&got).as_deref(), Some("b-set"));
+
+        cache.add_pending("/p/c/package.json", read("c", "c-worker"));
+        let got = cache.get("/p/c/package.json").expect("the entry of c");
+        let stored = cache.set("/p/c/package.json", read("c", "c-set").into_entry());
+        assert!(Rc::ptr_eq(&got, &stored), "get stored the pending read");
+        assert_eq!(name(&stored).as_deref(), Some("c-worker"));
+
+        let mut entries = 0;
+        cache.range(|_, _| {
+            entries += 1;
+            true
+        });
+        assert_eq!(entries, 3);
     }
 }
